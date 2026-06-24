@@ -1,0 +1,8 @@
+node_modules/
+.env
+*.log
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+public/*.apk
