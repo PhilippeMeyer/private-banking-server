@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Private Banking — Secure Web Login</title>
+  <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F7F8FA; min-height: 100vh; display: flex; }
+
+    .left-panel {
+      flex: 5; background: linear-gradient(135deg, #1A3A6B, #1A56DB);
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: 48px; position: relative; overflow: hidden;
+    }
+    .left-panel::before { content: ''; position: absolute; top: -80px; left: -80px; width: 320px; height: 320px; background: rgba(255,255,255,0.04); border-radius: 50%; }
+    .left-panel::after  { content: ''; position: absolute; bottom: -120px; right: -60px; width: 400px; height: 400px; background: rgba(255,255,255,0.05); border-radius: 50%; }
+
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon { width: 40px; height: 40px; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+    .logo-text { color: white; font-size: 18px; font-weight: 600; }
+
+    .headline { color: white; font-size: 44px; font-weight: 700; line-height: 1.15; letter-spacing: -1px; }
+    .subline { color: rgba(255,255,255,0.7); font-size: 16px; line-height: 1.6; margin-top: 20px; }
+
+    .stats { display: flex; gap: 0; }
+    .stat { flex: 1; }
+    .stat-value { color: white; font-size: 22px; font-weight: 700; }
+    .stat-label { color: rgba(255,255,255,0.6); font-size: 12px; line-height: 1.4; margin-top: 4px; }
+    .stat-divider { width: 1px; background: rgba(255,255,255,0.15); margin: 0 20px; }
+
+    .right-panel { flex: 4; background: white; display: flex; align-items: center; justify-content: center; }
+    .form-container { width: 100%; max-width: 400px; padding: 48px; }
+
+    h1 { font-size: 30px; font-weight: 700; color: #111827; letter-spacing: -0.5px; }
+    .subtitle { color: #6B7280; font-size: 15px; margin-top: 6px; margin-bottom: 40px; }
+
+    label { display: block; font-size: 13px; font-weight: 500; color: #111827; margin-bottom: 6px; }
+    input { width: 100%; padding: 12px 16px; border: 1px solid #E5E7EB; border-radius: 10px; font-size: 15px; background: #F7F8FA; outline: none; transition: border 0.2s; }
+    input:focus { border-color: #1A56DB; background: white; }
+    .field { margin-bottom: 20px; }
+
+    button {
+      width: 100%; padding: 14px; background: #1A56DB; color: white; border: none;
+      border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .error { background: #FEF2F2; border: 1px solid #FCA5A5; border-radius: 8px; padding: 12px; color: #DC2626; font-size: 13px; margin-bottom: 16px; display: none; }
+    .error.show { display: block; }
+
+    /* Pending approval state */
+    .pending { display: none; text-align: center; }
+    .pending.show { display: block; }
+    .pending-icon { font-size: 48px; margin-bottom: 16px; }
+    .pending h2 { font-size: 22px; font-weight: 700; color: #111827; }
+    .pending p { color: #6B7280; margin-top: 8px; font-size: 14px; }
+    .spinner { width: 40px; height: 40px; border: 3px solid #E5E7EB; border-top-color: #1A56DB; border-radius: 50%; animation: spin 1s linear infinite; margin: 24px auto; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .timer { font-size: 13px; color: #6B7280; margin-top: 16px; }
+    .timer span { color: #1A56DB; font-weight: 600; }
+
+    .rejected { display: none; text-align: center; }
+    .rejected.show { display: block; }
+    .rejected-icon { font-size: 48px; }
+
+    @media (max-width: 768px) {
+      .left-panel { display: none; }
+      .right-panel { padding: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="left-panel">
+    <div class="logo">
+      <div class="logo-icon">🏦</div>
+      <div class="logo-text">PrivateBank</div>
+    </div>
+    <div>
+      <div class="headline">Your wealth,<br>managed with<br>precision.</div>
+      <div class="subline">Access your portfolio, monitor markets,<br>and manage your finances securely.</div>
+      <div class="stats" style="margin-top: 48px;">
+        <div class="stat"><div class="stat-value">CHF 6.9B</div><div class="stat-label">Assets under<br>management</div></div>
+        <div class="stat-divider"></div>
+        <div class="stat"><div class="stat-value">150+</div><div class="stat-label">Years of<br>banking heritage</div></div>
+        <div class="stat-divider"></div>
+        <div class="stat"><div class="stat-value">99.9%</div><div class="stat-label">Platform<br>uptime</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="form-container">
+      <!-- Login form -->
+      <div id="loginForm">
+        <h1>Welcome back</h1>
+        <p class="subtitle">Sign in to your private banking account</p>
+
+        <div id="errorBox" class="error"></div>
+
+        <div class="field">
+          <label>Username</label>
+          <input type="text" id="username" placeholder="Enter your username" value="client" />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="password" placeholder="Enter your password" value="client123" />
+        </div>
+
+        <button id="loginBtn" onclick="startLogin()">Sign In with Mobile Approval</button>
+
+        <p style="margin-top: 20px; font-size: 12px; color: #6B7280; text-align: center;">
+          🔐 A push notification will be sent to your registered mobile device for approval
+        </p>
+      </div>
+
+      <!-- Pending approval -->
+      <div id="pendingState" class="pending">
+        <div class="pending-icon">📱</div>
+        <h2>Check your phone</h2>
+        <p>A login approval request has been sent to your mobile device.<br>Please approve it to continue.</p>
+        <div class="spinner"></div>
+        <p class="timer">Expires in <span id="countdown">3:00</span></p>
+        <button onclick="cancelLogin()" style="margin-top: 24px; background: #F3F4F6; color: #374151;">Cancel</button>
+      </div>
+
+      <!-- Rejected -->
+      <div id="rejectedState" class="rejected">
+        <div class="rejected-icon">🚫</div>
+        <h2 style="margin-top: 16px; color: #DC2626;">Login Rejected</h2>
+        <p style="margin-top: 8px; color: #6B7280;">The login request was rejected on your mobile device.</p>
+        <button onclick="resetLogin()" style="margin-top: 24px;">Try Again</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SERVER = 'https://private-banking-server-production.up.railway.app';
+    let challengeId = null;
+    let pollInterval = null;
+    let countdownInterval = null;
+    let expiresAt = null;
+
+    async function startLogin() {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value.trim();
+      const errorBox = document.getElementById('errorBox');
+      errorBox.classList.remove('show');
+
+      document.getElementById('loginBtn').disabled = true;
+      document.getElementById('loginBtn').textContent = 'Sending request…';
+
+      try {
+        const res = await fetch(`${SERVER}/auth/web-challenge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.error?.message || 'Login failed');
+        }
+
+        challengeId = data.challengeId;
+        expiresAt = data.expiresAt;
+
+        // Show pending state
+        document.getElementById('loginForm').style.display = 'none';
+        document.getElementById('pendingState').classList.add('show');
+
+        // Start countdown
+        startCountdown();
+
+        // Poll for status
+        pollInterval = setInterval(pollStatus, 2000);
+
+      } catch (err) {
+        errorBox.textContent = err.message;
+        errorBox.classList.add('show');
+        document.getElementById('loginBtn').disabled = false;
+        document.getElementById('loginBtn').textContent = 'Sign In with Mobile Approval';
+      }
+    }
+
+    async function pollStatus() {
+      if (!challengeId) return;
+      try {
+        const res = await fetch(`${SERVER}/auth/web-challenge/${challengeId}/status`);
+        const data = await res.json();
+
+        if (data.status === 'APPROVED') {
+          clearInterval(pollInterval);
+          clearInterval(countdownInterval);
+          // Store token and redirect to dashboard
+          localStorage.setItem('access_token', data.accessToken);
+          localStorage.setItem('user', JSON.stringify(data.user));
+          window.location.href = '/';
+        } else if (data.status === 'REJECTED') {
+          clearInterval(pollInterval);
+          clearInterval(countdownInterval);
+          document.getElementById('pendingState').classList.remove('show');
+          document.getElementById('rejectedState').classList.add('show');
+        } else if (data.status === 'EXPIRED') {
+          clearInterval(pollInterval);
+          clearInterval(countdownInterval);
+          resetLogin();
+          document.getElementById('errorBox').textContent = 'Request expired. Please try again.';
+          document.getElementById('errorBox').classList.add('show');
+        }
+      } catch (_) {}
+    }
+
+    function startCountdown() {
+      countdownInterval = setInterval(() => {
+        const remaining = Math.max(0, expiresAt - Date.now());
+        const m = Math.floor(remaining / 60000);
+        const s = Math.floor((remaining % 60000) / 1000);
+        document.getElementById('countdown').textContent = `${m}:${s.toString().padStart(2, '0')}`;
+        if (remaining === 0) clearInterval(countdownInterval);
+      }, 1000);
+    }
+
+    function cancelLogin() {
+      clearInterval(pollInterval);
+      clearInterval(countdownInterval);
+      challengeId = null;
+      resetLogin();
+    }
+
+    function resetLogin() {
+      document.getElementById('loginForm').style.display = 'block';
+      document.getElementById('pendingState').classList.remove('show');
+      document.getElementById('rejectedState').classList.remove('show');
+      document.getElementById('loginBtn').disabled = false;
+      document.getElementById('loginBtn').textContent = 'Sign In with Mobile Approval';
+    }
+
+    // Enter key support
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && document.getElementById('loginForm').style.display !== 'none') startLogin();
+    });
+  </script>
+</body>
+</html>
