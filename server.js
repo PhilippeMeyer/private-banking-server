@@ -4,15 +4,53 @@ const morgan = require('morgan');
 const swaggerUi = require('swagger-ui-express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const admin = require('firebase-admin');
 
 const app = express();
 const port = process.env.PORT || 3000;
-const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY || '';
-
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
+// ── Firebase Admin SDK init (for push notifications) ─────────────────────────
+let firebaseInitialized = false;
+try {
+  const serviceAccountB64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  if (serviceAccountB64) {
+    const serviceAccount = JSON.parse(Buffer.from(serviceAccountB64, 'base64').toString('utf-8'));
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    firebaseInitialized = true;
+    console.log('Firebase Admin SDK initialized');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT_BASE64 not set — push notifications disabled');
+  }
+} catch (err) {
+  console.error('Firebase Admin SDK init error:', err.message);
+}
+
+async function sendPushNotification(fcmToken, { title, body, data }) {
+  if (!firebaseInitialized) {
+    console.warn('Firebase not initialized — skipping push notification');
+    return { success: false, error: 'Firebase not configured' };
+  }
+  try {
+    const message = {
+      token: fcmToken,
+      notification: { title, body },
+      data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+      android: { priority: 'high' },
+      apns: { headers: { 'apns-priority': '10' } },
+    };
+    const response = await admin.messaging().send(message);
+    console.log('FCM sent:', response);
+    return { success: true, messageId: response };
+  } catch (err) {
+    console.error('FCM send error:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
 function authenticate(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth) return res.status(401).json({ error: 'Missing token' });
@@ -25,79 +63,76 @@ function authenticate(req, res, next) {
 const now = () => new Date().toISOString();
 const response = (data, meta = {}) => ({ data, meta: { timestamp: now(), correlationId: meta.correlationId || 'mock-id' } });
 
+// ── Users ──────────────────────────────────────────────────────────────────────
 const users = [
-  { id: 'u001', username: 'client', password: 'client123', name: 'Philippe Meyer', role: 'PRIVATE_CLIENT', portfolios: ['P-1001', 'P-1002', 'P-1003'] },
-  { id: 'u002', username: 'rm', password: 'rm123', name: 'John Smith', role: 'RELATIONSHIP_MANAGER', clients: ['u001'] },
-  { id: 'u003', username: 'credit', password: 'credit123', name: 'Sarah Wilson', role: 'CREDIT_OFFICER', signingLimit: 5000000 },
-  { id: 'u004', username: 'admin', password: 'admin123', name: 'System Administrator', role: 'ADMIN' }
+  { id: 'u001', username: 'client',  password: 'client123',  name: 'Philippe Meyer',      role: 'PRIVATE_CLIENT',       portfolios: ['P-1001','P-1002','P-1003'] },
+  { id: 'u002', username: 'rm',      password: 'rm123',      name: 'John Smith',           role: 'RELATIONSHIP_MANAGER', clients: ['u001'] },
+  { id: 'u003', username: 'credit',  password: 'credit123',  name: 'Sarah Wilson',         role: 'CREDIT_OFFICER',       signingLimit: 5000000 },
+  { id: 'u004', username: 'admin',   password: 'admin123',   name: 'System Administrator', role: 'ADMIN' }
 ];
 
 const documents = [
-  { id: 'DOC-1001', type: 'PORTFOLIO_STATEMENT', title: 'Portfolio Statement - April 2025', date: '2025-04-30', status: 'AVAILABLE', portfolioId: 'P-1001' },
-  { id: 'DOC-1002', type: 'LOMBARD_AGREEMENT', title: 'Lombard Facility Agreement', date: '2025-05-15', status: 'PENDING_SIGNATURE', portfolioId: 'P-1001' },
-  { id: 'DOC-1003', type: 'TAX_REPORT', title: 'Tax Report 2024', date: '2025-03-31', status: 'AVAILABLE', portfolioId: 'P-1001' }
+  { id: 'DOC-1001', type: 'PORTFOLIO_STATEMENT', title: 'Portfolio Statement - April 2025', date: '2025-04-30', status: 'AVAILABLE',         portfolioId: 'P-1001' },
+  { id: 'DOC-1002', type: 'LOMBARD_AGREEMENT',   title: 'Lombard Facility Agreement',       date: '2025-05-15', status: 'PENDING_SIGNATURE', portfolioId: 'P-1001' },
+  { id: 'DOC-1003', type: 'TAX_REPORT',          title: 'Tax Report 2024',                  date: '2025-03-31', status: 'AVAILABLE',         portfolioId: 'P-1001' }
 ];
 
 const notifications = [
   { id: 'N-1', type: 'DOCUMENT_AVAILABLE', title: 'New document available', message: 'Portfolio Statement - April 2025 is available.', read: false, createdAt: now() },
-  { id: 'N-2', type: 'PAYMENT_EXECUTED', title: 'Payment executed', message: 'Your payment of CHF 25,000 has been executed.', read: false, createdAt: now() }
+  { id: 'N-2', type: 'PAYMENT_EXECUTED',   title: 'Payment executed',       message: 'Your payment of CHF 25,000 has been executed.',  read: false, createdAt: now() }
 ];
 
 // ── Instruments ───────────────────────────────────────────────────────────────
 const instruments = {
-  'AAPL': { name: 'Apple Inc.', isin: 'US0378331005', currency: 'USD', price: 195.42, vol: 0.012 },
-  'NESN': { name: 'Nestlé SA', isin: 'CH0038863350', currency: 'CHF', price: 92.18, vol: 0.008 },
-  'NOVN': { name: 'Novartis AG', isin: 'CH0012221716', currency: 'CHF', price: 88.34, vol: 0.009 },
-  'MSFT': { name: 'Microsoft Corp.', isin: 'US5949181045', currency: 'USD', price: 415.20, vol: 0.011 },
-  'GOOGL': { name: 'Alphabet Inc.', isin: 'US02079K3059', currency: 'USD', price: 175.80, vol: 0.013 },
-  'ROG': { name: 'Roche Holding AG', isin: 'CH0012221716', currency: 'CHF', price: 245.60, vol: 0.007 },
-  'UBS': { name: 'UBS Group AG', isin: 'CH0244767585', currency: 'CHF', price: 28.45, vol: 0.014 },
-  'BOND-1': { name: 'Swiss Confederation 0.25% 2031', isin: 'CH0000000001', currency: 'CHF', price: 98.23, vol: 0.002 },
-  'BOND-2': { name: 'EU 1.5% 2033', isin: 'EU000A3KWAC0', currency: 'EUR', price: 96.45, vol: 0.003 },
-  'BOND-3': { name: 'US Treasury 4.25% 2029', isin: 'US912828YV68', currency: 'USD', price: 101.20, vol: 0.002 },
-  'CSCO': { name: 'Cisco Systems Inc.', isin: 'US17275R1023', currency: 'USD', price: 52.30, vol: 0.010 },
-  'ZURN': { name: 'Zurich Insurance Group', isin: 'CH0011075394', currency: 'CHF', price: 512.40, vol: 0.008 },
+  'AAPL':   { name: 'Apple Inc.',                     isin: 'US0378331005', currency: 'USD', price: 195.42,  vol: 0.012 },
+  'NESN':   { name: 'Nestlé SA',                      isin: 'CH0038863350', currency: 'CHF', price: 92.18,   vol: 0.008 },
+  'NOVN':   { name: 'Novartis AG',                    isin: 'CH0012221716', currency: 'CHF', price: 88.34,   vol: 0.009 },
+  'MSFT':   { name: 'Microsoft Corp.',                isin: 'US5949181045', currency: 'USD', price: 415.20,  vol: 0.011 },
+  'GOOGL':  { name: 'Alphabet Inc.',                  isin: 'US02079K3059', currency: 'USD', price: 175.80,  vol: 0.013 },
+  'ROG':    { name: 'Roche Holding AG',               isin: 'CH0012221716', currency: 'CHF', price: 245.60,  vol: 0.007 },
+  'UBS':    { name: 'UBS Group AG',                   isin: 'CH0244767585', currency: 'CHF', price: 28.45,   vol: 0.014 },
+  'BOND-1': { name: 'Swiss Confederation 0.25% 2031', isin: 'CH0000000001', currency: 'CHF', price: 98.23,   vol: 0.002 },
+  'BOND-2': { name: 'EU 1.5% 2033',                  isin: 'EU000A3KWAC0', currency: 'EUR', price: 96.45,   vol: 0.003 },
+  'BOND-3': { name: 'US Treasury 4.25% 2029',         isin: 'US912828YV68', currency: 'USD', price: 101.20,  vol: 0.002 },
+  'CSCO':   { name: 'Cisco Systems Inc.',             isin: 'US17275R1023', currency: 'USD', price: 52.30,   vol: 0.010 },
+  'ZURN':   { name: 'Zurich Insurance Group',         isin: 'CH0011075394', currency: 'CHF', price: 512.40,  vol: 0.008 },
 };
 
 const fx = { USD: 0.912, EUR: 0.987, CHF: 1.0 };
 
 const indices = {
-  'MSCI World': { value: 3210.45, vol: 0.008 },
-  'S&P 500': { value: 5278.40, vol: 0.009 },
-  'Euro Stoxx 50': { value: 4987.12, vol: 0.010 },
-  'Swiss Market Index': { value: 11792.30, vol: 0.007 },
+  'MSCI World':        { value: 3210.45, vol: 0.008 },
+  'S&P 500':           { value: 5278.40, vol: 0.009 },
+  'Euro Stoxx 50':     { value: 4987.12, vol: 0.010 },
+  'Swiss Market Index':{ value: 11792.30,vol: 0.007 },
 };
 
-// ── Portfolio metadata ────────────────────────────────────────────────────────
+// ── Portfolios ─────────────────────────────────────────────────────────────────
 const portfolioMeta = {
-  'P-1001': { name: 'Global Balanced Portfolio', mandate: 'Balanced', currency: 'CHF', cash: 2458320.45, color: '#1A56DB' },
-  'P-1002': { name: 'Growth Equity Mandate', mandate: 'Growth', currency: 'CHF', cash: 842150.20, color: '#8B5CF6' },
-  'P-1003': { name: 'Capital Preservation', mandate: 'Conservative', currency: 'CHF', cash: 1240000.00, color: '#059669' },
+  'P-1001': { name: 'Global Balanced Portfolio', mandate: 'Balanced',       currency: 'CHF', cash: 2458320.45, color: '#1A56DB' },
+  'P-1002': { name: 'Growth Equity Mandate',     mandate: 'Growth',         currency: 'CHF', cash: 842150.20,  color: '#8B5CF6' },
+  'P-1003': { name: 'Capital Preservation',      mandate: 'Conservative',   currency: 'CHF', cash: 1240000.00, color: '#059669' },
 };
 
-// ── Positions per portfolio ───────────────────────────────────────────────────
 const positionBase = [
-  // P-1001: Global Balanced
-  { id: 'POS-1', portfolioId: 'P-1001', instrumentId: 'AAPL', assetClass: 'Equities', quantity: 1258 },
-  { id: 'POS-2', portfolioId: 'P-1001', instrumentId: 'NESN', assetClass: 'Equities', quantity: 2000 },
-  { id: 'POS-3', portfolioId: 'P-1001', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 1000000 },
-  { id: 'POS-4', portfolioId: 'P-1001', instrumentId: 'MSFT', assetClass: 'Equities', quantity: 420 },
-  { id: 'POS-5', portfolioId: 'P-1001', instrumentId: 'NOVN', assetClass: 'Equities', quantity: 1800 },
-  { id: 'POS-6', portfolioId: 'P-1001', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 500000 },
-  { id: 'POS-7', portfolioId: 'P-1001', instrumentId: 'ZURN', assetClass: 'Equities', quantity: 150 },
-  // P-1002: Growth Equity
-  { id: 'POS-8', portfolioId: 'P-1002', instrumentId: 'AAPL', assetClass: 'Equities', quantity: 850 },
-  { id: 'POS-9', portfolioId: 'P-1002', instrumentId: 'MSFT', assetClass: 'Equities', quantity: 620 },
-  { id: 'POS-10', portfolioId: 'P-1002', instrumentId: 'GOOGL', assetClass: 'Equities', quantity: 480 },
-  { id: 'POS-11', portfolioId: 'P-1002', instrumentId: 'CSCO', assetClass: 'Equities', quantity: 3200 },
-  { id: 'POS-12', portfolioId: 'P-1002', instrumentId: 'NOVN', assetClass: 'Equities', quantity: 900 },
-  { id: 'POS-13', portfolioId: 'P-1002', instrumentId: 'ROG', assetClass: 'Equities', quantity: 420 },
-  // P-1003: Capital Preservation
-  { id: 'POS-14', portfolioId: 'P-1003', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 2000000 },
-  { id: 'POS-15', portfolioId: 'P-1003', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 1500000 },
-  { id: 'POS-16', portfolioId: 'P-1003', instrumentId: 'BOND-3', assetClass: 'Fixed Income', quantity: 800000 },
-  { id: 'POS-17', portfolioId: 'P-1003', instrumentId: 'NESN', assetClass: 'Equities', quantity: 500 },
-  { id: 'POS-18', portfolioId: 'P-1003', instrumentId: 'ZURN', assetClass: 'Equities', quantity: 80 },
+  { id: 'POS-1',  portfolioId: 'P-1001', instrumentId: 'AAPL',   assetClass: 'Equities',     quantity: 1258  },
+  { id: 'POS-2',  portfolioId: 'P-1001', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 2000  },
+  { id: 'POS-3',  portfolioId: 'P-1001', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 10000 },
+  { id: 'POS-4',  portfolioId: 'P-1001', instrumentId: 'MSFT',   assetClass: 'Equities',     quantity: 420   },
+  { id: 'POS-5',  portfolioId: 'P-1001', instrumentId: 'NOVN',   assetClass: 'Equities',     quantity: 1800  },
+  { id: 'POS-6',  portfolioId: 'P-1001', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 5000  },
+  { id: 'POS-7',  portfolioId: 'P-1001', instrumentId: 'ZURN',   assetClass: 'Equities',     quantity: 150   },
+  { id: 'POS-8',  portfolioId: 'P-1002', instrumentId: 'AAPL',   assetClass: 'Equities',     quantity: 850   },
+  { id: 'POS-9',  portfolioId: 'P-1002', instrumentId: 'MSFT',   assetClass: 'Equities',     quantity: 620   },
+  { id: 'POS-10', portfolioId: 'P-1002', instrumentId: 'GOOGL',  assetClass: 'Equities',     quantity: 480   },
+  { id: 'POS-11', portfolioId: 'P-1002', instrumentId: 'CSCO',   assetClass: 'Equities',     quantity: 3200  },
+  { id: 'POS-12', portfolioId: 'P-1002', instrumentId: 'NOVN',   assetClass: 'Equities',     quantity: 900   },
+  { id: 'POS-13', portfolioId: 'P-1002', instrumentId: 'ROG',    assetClass: 'Equities',     quantity: 420   },
+  { id: 'POS-14', portfolioId: 'P-1003', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 20000 },
+  { id: 'POS-15', portfolioId: 'P-1003', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 15000 },
+  { id: 'POS-16', portfolioId: 'P-1003', instrumentId: 'BOND-3', assetClass: 'Fixed Income', quantity: 8000  },
+  { id: 'POS-17', portfolioId: 'P-1003', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 500   },
+  { id: 'POS-18', portfolioId: 'P-1003', instrumentId: 'ZURN',   assetClass: 'Equities',     quantity: 80    },
 ];
 
 const costBasis = {
@@ -107,11 +142,11 @@ const costBasis = {
 };
 
 const transactions = [
-  { id: 'TX-1', portfolioId: 'P-1001', tradeDate: '2025-05-23', settlementDate: '2025-05-27', type: 'BUY', instrument: 'Apple Inc.', instrumentId: 'AAPL', quantity: 150, price: 195.42, currency: 'USD', amountChf: -26423.70, account: 'Personal 12345678', status: 'SETTLED' },
-  { id: 'TX-2', portfolioId: 'P-1001', tradeDate: '2025-05-22', settlementDate: '2025-05-26', type: 'SELL', instrument: 'Nestlé SA', instrumentId: 'NESN', quantity: 200, price: 92.18, currency: 'CHF', amountChf: 18436.00, account: 'Personal 12345678', status: 'SETTLED' },
-  { id: 'TX-3', portfolioId: 'P-1001', tradeDate: '2025-05-20', settlementDate: '2025-05-20', type: 'DIVIDEND', instrument: 'Novartis AG', instrumentId: 'NOVN', quantity: null, price: null, currency: 'CHF', amountChf: 246.80, account: 'Personal 12345678', status: 'BOOKED' },
-  { id: 'TX-4', portfolioId: 'P-1002', tradeDate: '2025-05-21', settlementDate: '2025-05-25', type: 'BUY', instrument: 'Alphabet Inc.', instrumentId: 'GOOGL', quantity: 80, price: 175.80, currency: 'USD', amountChf: -12825.98, account: 'Growth 98765432', status: 'SETTLED' },
-  { id: 'TX-5', portfolioId: 'P-1003', tradeDate: '2025-05-19', settlementDate: '2025-05-23', type: 'BUY', instrument: 'Swiss Conf.', instrumentId: 'BOND-1', quantity: 200000, price: 98.23, currency: 'CHF', amountChf: -196460.00, account: 'Preservation 11223344', status: 'SETTLED' },
+  { id: 'TX-1', portfolioId: 'P-1001', tradeDate: '2025-05-23', settlementDate: '2025-05-27', type: 'BUY',      instrument: 'Apple Inc.',   instrumentId: 'AAPL',   quantity: 150, price: 195.42, currency: 'USD', amountChf: -26423.70, account: 'Personal 12345678', status: 'SETTLED' },
+  { id: 'TX-2', portfolioId: 'P-1001', tradeDate: '2025-05-22', settlementDate: '2025-05-26', type: 'SELL',     instrument: 'Nestlé SA',    instrumentId: 'NESN',   quantity: 200, price: 92.18,  currency: 'CHF', amountChf: 18436.00,  account: 'Personal 12345678', status: 'SETTLED' },
+  { id: 'TX-3', portfolioId: 'P-1001', tradeDate: '2025-05-20', settlementDate: '2025-05-20', type: 'DIVIDEND', instrument: 'Novartis AG',  instrumentId: 'NOVN',   quantity: null,price: null,   currency: 'CHF', amountChf: 246.80,    account: 'Personal 12345678', status: 'BOOKED'  },
+  { id: 'TX-4', portfolioId: 'P-1002', tradeDate: '2025-05-21', settlementDate: '2025-05-25', type: 'BUY',      instrument: 'Alphabet Inc.',instrumentId: 'GOOGL',  quantity: 80,  price: 175.80, currency: 'USD', amountChf: -12825.98, account: 'Growth 98765432',   status: 'SETTLED' },
+  { id: 'TX-5', portfolioId: 'P-1003', tradeDate: '2025-05-19', settlementDate: '2025-05-23', type: 'BUY',      instrument: 'Swiss Conf.',  instrumentId: 'BOND-1', quantity: 2000, price: 98.23, currency: 'CHF', amountChf: -196460.00, account: 'Preservation 11223344', status: 'SETTLED' },
 ];
 
 // ── GBM price simulation ──────────────────────────────────────────────────────
@@ -124,7 +159,6 @@ function gbmTick(price, vol) {
 let priceHistory = {};
 let connectedClients = new Set();
 
-// ── Derived data functions ────────────────────────────────────────────────────
 function getLivePositions(portfolioId) {
   return positionBase
     .filter(p => p.portfolioId === portfolioId)
@@ -154,11 +188,7 @@ function getLivePortfolio(portfolioId) {
   const prevValue = totalValue * 0.9801;
   const allocation = getAllocation(portfolioId, positions, totalValue);
   return {
-    id: portfolioId,
-    name: meta.name,
-    mandate: meta.mandate,
-    baseCurrency: meta.currency,
-    color: meta.color,
+    id: portfolioId, name: meta.name, mandate: meta.mandate, baseCurrency: meta.currency, color: meta.color,
     value: +totalValue.toFixed(2),
     dayChange: +(totalValue - prevValue).toFixed(2),
     dayChangePct: +((totalValue - prevValue) / prevValue * 100).toFixed(2),
@@ -169,14 +199,10 @@ function getLivePortfolio(portfolioId) {
 function getAllocation(portfolioId, positions, totalValue) {
   const meta = portfolioMeta[portfolioId];
   const byClass = {};
-  for (const p of positions) {
-    byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
-  }
+  for (const p of positions) byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
   byClass['Cash & Money Market'] = (byClass['Cash & Money Market'] || 0) + meta.cash;
   return Object.entries(byClass).map(([assetClass, valueChf]) => ({
-    assetClass,
-    pct: +((valueChf / totalValue) * 100).toFixed(1),
-    valueChf: +valueChf.toFixed(0),
+    assetClass, pct: +((valueChf / totalValue) * 100).toFixed(1), valueChf: +valueChf.toFixed(0),
   }));
 }
 
@@ -188,38 +214,23 @@ function getAggregatedDashboard() {
   const portfolios = getAllPortfolios();
   const totalAum = portfolios.reduce((s, p) => s + p.value, 0);
   const totalDayChange = portfolios.reduce((s, p) => s + p.dayChange, 0);
-
-  // Portfolio allocation (each portfolio as a slice)
   const portfolioAllocation = portfolios.map(p => ({
-    portfolioId: p.id,
-    name: p.name,
-    mandate: p.mandate,
-    color: p.color,
-    value: p.value,
-    pct: +((p.value / totalAum) * 100).toFixed(1),
+    portfolioId: p.id, name: p.name, mandate: p.mandate, color: p.color,
+    value: p.value, pct: +((p.value / totalAum) * 100).toFixed(1),
   }));
-
-  // Aggregated asset allocation across all portfolios
   const allPositions = Object.keys(portfolioMeta).flatMap(id => getLivePositions(id));
   const byClass = {};
-  for (const p of allPositions) {
-    byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
-  }
+  for (const p of allPositions) byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
   const totalCash = Object.values(portfolioMeta).reduce((s, m) => s + m.cash, 0);
   byClass['Cash & Money Market'] = (byClass['Cash & Money Market'] || 0) + totalCash;
   const assetAllocation = Object.entries(byClass).map(([assetClass, valueChf]) => ({
-    assetClass,
-    pct: +((valueChf / totalAum) * 100).toFixed(1),
-    valueChf: +valueChf.toFixed(0),
+    assetClass, pct: +((valueChf / totalAum) * 100).toFixed(1), valueChf: +valueChf.toFixed(0),
   }));
-
   return {
     totalAum: +totalAum.toFixed(2),
     totalDayChange: +totalDayChange.toFixed(2),
     totalDayChangePct: +((totalDayChange / (totalAum - totalDayChange)) * 100).toFixed(2),
-    portfolios,
-    portfolioAllocation,
-    assetAllocation,
+    portfolios, portfolioAllocation, assetAllocation,
     marketOverview: getMarketOverview(),
     recentActivity: transactions.slice(0, 5),
     unreadNotifications: notifications.filter(n => !n.read).length,
@@ -233,7 +244,7 @@ function getMarketOverview() {
   }));
 }
 
-// ── Simulation ────────────────────────────────────────────────────────────────
+// ── Simulation loop ───────────────────────────────────────────────────────────
 let tradeCounter = 100;
 function tickPrices() {
   const changed = [];
@@ -300,8 +311,91 @@ app.post('/api/v1/auth/login', (req, res) => {
   res.json({ accessToken: token, tokenType: 'Bearer', expiresIn: 3600, user: { id: user.id, name: user.name, role: user.role } });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: now() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: now(), firebaseReady: firebaseInitialized }));
 app.use('/static', express.static('public'));
+
+// ── Web login challenge (push notification approval) ─────────────────────────
+const fcmTokens = {};
+const authChallenges = {};
+
+app.post('/auth/fcm-token', authenticate, (req, res) => {
+  const { fcmToken } = req.body;
+  if (!fcmToken) return res.status(400).json({ error: 'Missing fcmToken' });
+  fcmTokens[req.user.userId] = fcmToken;
+  console.log(`FCM token registered for user ${req.user.userId}`);
+  res.json({ success: true });
+});
+
+app.post('/auth/web-challenge', async (req, res) => {
+  const { username, password } = req.body;
+  const user = users.find(u => u.username === username && u.password === password);
+  if (!user) return res.status(401).json({ error: { code: 'AUTH_FAILED', message: 'Invalid credentials' } });
+
+  const fcmToken = fcmTokens[user.id];
+  if (!fcmToken) {
+    return res.status(400).json({ error: { code: 'NO_MOBILE_DEVICE', message: 'No mobile device registered for this account. Please log in via the mobile app first.' } });
+  }
+
+  const challengeId = 'CHG-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+  const expiresAt = Date.now() + 3 * 60 * 1000;
+  authChallenges[challengeId] = {
+    userId: user.id, userName: user.name, status: 'PENDING', expiresAt,
+    ipAddress: req.ip || req.headers['x-forwarded-for'] || 'Unknown',
+    userAgent: req.headers['user-agent'] || 'Unknown',
+    createdAt: new Date().toISOString(),
+  };
+
+  const result = await sendPushNotification(fcmToken, {
+    title: '🔐 New login request',
+    body: 'Someone is trying to log into your account. Tap to approve or reject.',
+    data: {
+      type: 'WEB_LOGIN_CHALLENGE', challengeId, userName: user.name,
+      ipAddress: authChallenges[challengeId].ipAddress,
+      timestamp: authChallenges[challengeId].createdAt,
+    },
+  });
+  if (!result.success) console.warn('Push notification failed:', result.error);
+
+  res.json({ challengeId, expiresAt, message: 'Please approve the login request on your mobile device.' });
+});
+
+app.get('/auth/web-challenge/:challengeId/status', (req, res) => {
+  const challenge = authChallenges[req.params.challengeId];
+  if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
+  if (Date.now() > challenge.expiresAt) challenge.status = 'EXPIRED';
+  if (challenge.status === 'APPROVED') {
+    const user = users.find(u => u.id === challenge.userId);
+    const token = Buffer.from(JSON.stringify({ userId: user.id, role: user.role })).toString('base64');
+    delete authChallenges[req.params.challengeId];
+    return res.json({ status: 'APPROVED', accessToken: token, user: { id: user.id, name: user.name, role: user.role } });
+  }
+  res.json({ status: challenge.status, expiresAt: challenge.expiresAt });
+});
+
+app.post('/auth/web-challenge/:challengeId/approve', authenticate, (req, res) => {
+  const challenge = authChallenges[req.params.challengeId];
+  if (!challenge) return res.status(404).json({ error: 'Challenge not found or already used' });
+  if (Date.now() > challenge.expiresAt) return res.status(400).json({ error: 'Challenge expired' });
+  if (challenge.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
+  challenge.status = 'APPROVED';
+  res.json({ success: true, message: 'Login approved' });
+});
+
+app.post('/auth/web-challenge/:challengeId/reject', authenticate, (req, res) => {
+  const challenge = authChallenges[req.params.challengeId];
+  if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
+  if (challenge.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
+  challenge.status = 'REJECTED';
+  delete authChallenges[req.params.challengeId];
+  res.json({ success: true, message: 'Login rejected' });
+});
+
+setInterval(() => {
+  const nowMs = Date.now();
+  for (const [id, challenge] of Object.entries(authChallenges)) {
+    if (nowMs > challenge.expiresAt + 60000) delete authChallenges[id];
+  }
+}, 60000);
 
 // ── Dashboard & portfolio endpoints ──────────────────────────────────────────
 app.get('/bff/mobile/dashboard', (req, res) => res.json(response(getAggregatedDashboard())));
@@ -323,144 +417,8 @@ app.get('/portfolios/:id/allocation', (req, res) => {
   const portfolio = getLivePortfolio(req.params.id);
   res.json(response(portfolio?.allocation || []));
 });
-// ── Auth challenge endpoints to ADD to server.js ─────────────────────────────
-// These are the new endpoints — paste them into server.js before the swagger section
 
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
-// In-memory stores (use Redis in production)
-const fcmTokens = {};        // userId → fcmToken
-const authChallenges = {};   // challengeId → { userId, status, token, expiresAt, ipAddress, userAgent }
-
-const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY || 'YOUR_FCM_SERVER_KEY';
-
-// ── FCM token registration ────────────────────────────────────────────────────
-// POST /auth/fcm-token  { fcmToken }
-// Call this from Flutter on startup after getting FCM token
-app.post('/auth/fcm-token', authenticate, (req, res) => {
-  const { fcmToken } = req.body;
-  if (!fcmToken) return res.status(400).json({ error: 'Missing fcmToken' });
-  fcmTokens[req.user.userId] = fcmToken;
-  console.log(`FCM token registered for user ${req.user.userId}`);
-  res.json({ success: true });
-});
-
-// ── Web login — step 1: create challenge ─────────────────────────────────────
-// POST /auth/web-challenge  { username, password }
-// Web browser calls this. Server validates credentials, sends push to mobile.
-app.post('/auth/web-challenge', async (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ error: { code: 'AUTH_FAILED', message: 'Invalid credentials' } });
-
-  const fcmToken = fcmTokens[user.id];
-  if (!fcmToken) {
-    return res.status(400).json({ error: { code: 'NO_MOBILE_DEVICE', message: 'No mobile device registered for this account. Please log in via the mobile app first.' } });
-  }
-
-  // Create challenge
-  const challengeId = 'CHG-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-  const expiresAt = Date.now() + 3 * 60 * 1000; // 3 minutes
-  authChallenges[challengeId] = {
-    userId: user.id,
-    userName: user.name,
-    status: 'PENDING',
-    expiresAt,
-    ipAddress: req.ip || req.headers['x-forwarded-for'] || 'Unknown',
-    userAgent: req.headers['user-agent'] || 'Unknown',
-    createdAt: new Date().toISOString(),
-  };
-
-  // Send FCM push notification to mobile
-  try {
-    const fcmResponse = await fetch('https://fcm.googleapis.com/fcm/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': `key=${FCM_SERVER_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        to: fcmToken,
-        priority: 'high',
-        data: {
-          type: 'WEB_LOGIN_CHALLENGE',
-          challengeId,
-          userName: user.name,
-          ipAddress: authChallenges[challengeId].ipAddress,
-          timestamp: authChallenges[challengeId].createdAt,
-        },
-        notification: {
-          title: '🔐 New login request',
-          body: `Someone is trying to log into your account. Tap to approve or reject.`,
-          sound: 'default',
-        },
-      }),
-    });
-    const fcmResult = await fcmResponse.json();
-    console.log('FCM sent:', JSON.stringify(fcmResult));
-  } catch (err) {
-    console.error('FCM error:', err);
-  }
-
-  res.json({
-    challengeId,
-    expiresAt,
-    message: 'Please approve the login request on your mobile device.',
-  });
-});
-
-// ── Web login — step 2: poll for status ──────────────────────────────────────
-// GET /auth/web-challenge/:challengeId/status
-// Web browser polls this every 2 seconds
-app.get('/auth/web-challenge/:challengeId/status', (req, res) => {
-  const challenge = authChallenges[req.params.challengeId];
-  if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
-
-  if (Date.now() > challenge.expiresAt) {
-    challenge.status = 'EXPIRED';
-  }
-
-  if (challenge.status === 'APPROVED') {
-    // Generate access token
-    const user = users.find(u => u.id === challenge.userId);
-    const token = Buffer.from(JSON.stringify({ userId: user.id, role: user.role })).toString('base64');
-    delete authChallenges[req.params.challengeId]; // one-time use
-    return res.json({ status: 'APPROVED', accessToken: token, user: { id: user.id, name: user.name, role: user.role } });
-  }
-
-  res.json({ status: challenge.status, expiresAt: challenge.expiresAt });
-});
-
-// ── Mobile — approve or reject challenge ─────────────────────────────────────
-// POST /auth/web-challenge/:challengeId/approve  or  /reject
-// Flutter app calls this after biometric confirmation
-app.post('/auth/web-challenge/:challengeId/approve', authenticate, (req, res) => {
-  const challenge = authChallenges[req.params.challengeId];
-  if (!challenge) return res.status(404).json({ error: 'Challenge not found or already used' });
-  if (Date.now() > challenge.expiresAt) return res.status(400).json({ error: 'Challenge expired' });
-  if (challenge.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
-  challenge.status = 'APPROVED';
-  res.json({ success: true, message: 'Login approved' });
-});
-
-app.post('/auth/web-challenge/:challengeId/reject', authenticate, (req, res) => {
-  const challenge = authChallenges[req.params.challengeId];
-  if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
-  if (challenge.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
-  challenge.status = 'REJECTED';
-  delete authChallenges[req.params.challengeId];
-  res.json({ success: true, message: 'Login rejected' });
-});
-
-// ── Cleanup expired challenges every minute ───────────────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, challenge] of Object.entries(authChallenges)) {
-    if (now > challenge.expiresAt + 60000) delete authChallenges[id];
-  }
-}, 60000);
-
-// ── Other endpoints (unchanged) ───────────────────────────────────────────────
+// ── Other endpoints ────────────────────────────────────────────────────────────
 app.get('/positions/:id', (req, res) => {
   const all = Object.keys(portfolioMeta).flatMap(id => getLivePositions(id));
   res.json(response(all.find(p => p.id === req.params.id) || null));
@@ -494,7 +452,7 @@ app.get('/research', (req, res) => res.json(response([
 ])));
 app.get('/workflow/tasks', (req, res) => res.json(response([])));
 
-const swaggerDocument = { openapi: '3.0.3', info: { title: 'Private Banking Mock API v2', version: '2.1.0' }, servers: [{ url: 'http://localhost:3000' }], paths: {} };
+const swaggerDocument = { openapi: '3.0.3', info: { title: 'Private Banking Mock API v2', version: '2.2.0' }, servers: [{ url: 'http://localhost:3000' }], paths: {} };
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -509,8 +467,8 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(port, () => {
-  console.log(`\n🏦 Private Banking Mock Server v2.1 — Multi-Portfolio`);
+  console.log(`\n🏦 Private Banking Mock Server v2.2 — Multi-Portfolio + Push Auth`);
   console.log(`   REST → http://localhost:${port}`);
   console.log(`   WS   → ws://localhost:${port}/events`);
-  console.log(`   Portfolios: P-1001 (Balanced), P-1002 (Growth), P-1003 (Conservative)\n`);
+  console.log(`   Firebase: ${firebaseInitialized ? 'READY' : 'NOT CONFIGURED'}\n`);
 });

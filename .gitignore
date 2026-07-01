@@ -6,3 +6,7 @@ build/
 .flutter-plugins
 .flutter-plugins-dependencies
 public/*.apk
+
+*firebase-adminsdk*.json
+*service-account*.json
+serviceAccount.json
