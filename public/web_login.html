@@ -199,7 +199,7 @@
           // Store token and redirect to dashboard
           localStorage.setItem('access_token', data.accessToken);
           localStorage.setItem('user', JSON.stringify(data.user));
-          window.location.href = '/';
+          window.location.href = 'https://private-banking-client.vercel.app';
         } else if (data.status === 'REJECTED') {
           clearInterval(pollInterval);
           clearInterval(countdownInterval);
