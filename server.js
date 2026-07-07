@@ -5,27 +5,15 @@ const morgan = require('morgan');
 const { WebSocketServer } = require('ws');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const fs = require('fs');
-const path = require('path');
 const admin = require('firebase-admin');
 
 const app = express();
 const port = process.env.PORT || 3001;
-app.use(cors({
-  origin: [
-    'https://staff-banking.meyer.today',
-    'https://client-banking.meyer.today',
-    'https://api-banking.meyer.today',
-    'http://localhost:3001',
-    'http://localhost:8080',
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-}));
+app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json());
 app.use(morgan('dev'));
 
-const SERVER_VERSION = '2.0.0';
+const SERVER_VERSION = '3.1.0';
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
 let firebaseInitialized = false;
@@ -36,37 +24,20 @@ try {
     admin.initializeApp({ credential: admin.credential.cert(sa) });
     firebaseInitialized = true;
     console.log('Firebase initialized');
-  } else {
-    console.warn('Firebase not configured');
   }
-} catch (e) {
-  console.error('Firebase init error:', e.message);
-}
+} catch (e) { console.error('Firebase init error:', e.message); }
 
 async function sendPush(fcmToken, { title, body, data }) {
-  if (!firebaseInitialized) return { success: false };
+  if (!firebaseInitialized) return;
   try {
-    const msg = {
+    const res = await admin.messaging().send({
       token: fcmToken,
       notification: { title, body },
       data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
-      android: {
-        priority: 'high',
-        notification: {
-          channelId: 'auth_channel',
-          priority: 'max',
-          defaultSound: true,
-          defaultVibrateTimings: true,
-        },
-      },
-    };
-    const res = await admin.messaging().send(msg);
+      android: { priority: 'high', notification: { channelId: 'auth_channel', priority: 'max' } },
+    });
     console.log('FCM sent:', res);
-    return { success: true, messageId: res };
-  } catch (e) {
-    console.error('FCM error:', e.message);
-    return { success: false, error: e.message };
-  }
+  } catch (e) { console.error('FCM error:', e.message); }
 }
 
 // ── Flowable ──────────────────────────────────────────────────────────────────
@@ -79,47 +50,42 @@ async function flowable(method, path, body) {
     headers: { 'Content-Type': 'application/json', 'Authorization': FLOWABLE_AUTH },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Flowable ${method} ${path} → ${res.status}: ${text}`);
-  }
-  const text = await res.text(); return text ? JSON.parse(text) : null;
+  if (!res.ok) { const t = await res.text(); throw new Error(`Flowable ${method} ${path} → ${res.status}: ${t}`); }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
 }
 
-// ── Auth helpers ──────────────────────────────────────────────────────────────
 const now = () => new Date().toISOString();
-const response = (data, meta = {}) => ({ data, meta: { timestamp: now(), correlationId: meta.correlationId || 'mock-id' } });
+const response = (data) => ({ data, meta: { timestamp: now() } });
 
 function authenticate(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth) return res.status(401).json({ error: 'Missing token' });
-  try {
-    req.user = JSON.parse(Buffer.from(auth.replace('Bearer ', ''), 'base64').toString());
-    next();
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  try { req.user = JSON.parse(Buffer.from(auth.replace('Bearer ', ''), 'base64').toString()); next(); }
+  catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
-// ── Users ─────────────────────────────────────────────────────────────────────
+// ── Users & config ────────────────────────────────────────────────────────────
 const users = [
   { id: 'u001', username: 'client',     password: 'client123',  name: 'Philippe Meyer',      role: 'PRIVATE_CLIENT',       portfolios: ['P-1001','P-1002','P-1003'] },
-  { id: 'u002', username: 'rm',         password: 'rm123',      name: 'John Smith',           role: 'RELATIONSHIP_MANAGER', clients: ['u001'] },
-  { id: 'u003', username: 'credit',     password: 'credit123',  name: 'Sarah Wilson',         role: 'CREDIT_OFFICER',       signingLimit: 5000000 },
+  { id: 'u002', username: 'rm',         password: 'rm123',      name: 'John Smith',           role: 'RELATIONSHIP_MANAGER' },
+  { id: 'u003', username: 'credit',     password: 'credit123',  name: 'Sarah Wilson',         role: 'CREDIT_OFFICER' },
   { id: 'u004', username: 'admin',      password: 'admin123',   name: 'System Administrator', role: 'ADMIN' },
   { id: 'u005', username: 'compliance', password: 'comp123',    name: 'Marie Dubois',         role: 'COMPLIANCE_OFFICER' },
+  { id: 'u006', username: 'sophie',     password: 'sophie123',  name: 'Sophie Meyer',         role: 'PRIVATE_CLIENT',       portfolios: [], coSignerFor: ['u001'] },
 ];
 
-const documents = [
-  { id: 'DOC-1001', type: 'PORTFOLIO_STATEMENT', title: 'Portfolio Statement - April 2025', date: '2025-04-30', status: 'AVAILABLE',         portfolioId: 'P-1001' },
-  { id: 'DOC-1002', type: 'LOMBARD_AGREEMENT',   title: 'Lombard Facility Agreement',       date: '2025-05-15', status: 'PENDING_SIGNATURE', portfolioId: 'P-1001' },
-  { id: 'DOC-1003', type: 'TAX_REPORT',          title: 'Tax Report 2024',                  date: '2025-03-31', status: 'AVAILABLE',         portfolioId: 'P-1001' },
-];
+const clientConfig = {
+  'u001': { coSignerId: 'u006', coSignerName: 'Sophie Meyer', coSignThreshold: 10000, rmThreshold: 50000 },
+};
 
-const notifications = [
-  { id: 'N-1', type: 'DOCUMENT_AVAILABLE', title: 'New document available', message: 'Portfolio Statement - April 2025 is available.', read: false, createdAt: now() },
-  { id: 'N-2', type: 'PAYMENT_EXECUTED',   title: 'Payment executed',       message: 'Your payment of CHF 25,000 has been executed.',  read: false, createdAt: now() },
-];
+const roleTaskMap = {
+  'COMPLIANCE_OFFICER':   ['staffReview', 'complianceValidation'],
+  'RELATIONSHIP_MANAGER': ['rmApproval', 'customerCallback'],
+  'ADMIN': null,
+};
 
-// ── Instruments ───────────────────────────────────────────────────────────────
+// ── Market data ───────────────────────────────────────────────────────────────
 const instruments = {
   'AAPL':   { name: 'Apple Inc.',                     isin: 'US0378331005', currency: 'USD', price: 195.42,  vol: 0.012 },
   'NESN':   { name: 'Nestlé SA',                      isin: 'CH0038863350', currency: 'CHF', price: 92.18,   vol: 0.008 },
@@ -134,23 +100,18 @@ const instruments = {
   'CSCO':   { name: 'Cisco Systems Inc.',             isin: 'US17275R1023', currency: 'USD', price: 52.30,   vol: 0.010 },
   'ZURN':   { name: 'Zurich Insurance Group',         isin: 'CH0011075394', currency: 'CHF', price: 512.40,  vol: 0.008 },
 };
-
 const fx = { USD: 0.912, EUR: 0.987, CHF: 1.0 };
-
 const indices = {
   'MSCI World':        { value: 3210.45, vol: 0.008 },
   'S&P 500':           { value: 5278.40, vol: 0.009 },
   'Euro Stoxx 50':     { value: 4987.12, vol: 0.010 },
   'Swiss Market Index':{ value: 11792.30,vol: 0.007 },
 };
-
-// ── Portfolios ────────────────────────────────────────────────────────────────
 const portfolioMeta = {
   'P-1001': { name: 'Global Balanced Portfolio', mandate: 'Balanced',     currency: 'CHF', cash: 2458320.45, color: '#1A56DB' },
   'P-1002': { name: 'Growth Equity Mandate',     mandate: 'Growth',       currency: 'CHF', cash: 842150.20,  color: '#8B5CF6' },
   'P-1003': { name: 'Capital Preservation',      mandate: 'Conservative', currency: 'CHF', cash: 1240000.00, color: '#059669' },
 };
-
 const positionBase = [
   { id: 'POS-1',  portfolioId: 'P-1001', instrumentId: 'AAPL',   assetClass: 'Equities',     quantity: 1258  },
   { id: 'POS-2',  portfolioId: 'P-1001', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 2000  },
@@ -171,569 +132,426 @@ const positionBase = [
   { id: 'POS-17', portfolioId: 'P-1003', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 500   },
   { id: 'POS-18', portfolioId: 'P-1003', instrumentId: 'ZURN',   assetClass: 'Equities',     quantity: 80    },
 ];
-
-const costBasis = {
-  'AAPL': 178.00, 'NESN': 88.00, 'BOND-1': 100.00, 'MSFT': 380.00, 'NOVN': 84.00,
-  'GOOGL': 155.00, 'ROG': 230.00, 'UBS': 25.00, 'BOND-2': 98.00, 'BOND-3': 99.50,
-  'CSCO': 48.00, 'ZURN': 480.00,
-};
-
+const costBasis = { 'AAPL':178,'NESN':88,'BOND-1':100,'MSFT':380,'NOVN':84,'GOOGL':155,'ROG':230,'UBS':25,'BOND-2':98,'BOND-3':99.5,'CSCO':48,'ZURN':480 };
 const transactions = [
-  { id: 'TX-1', portfolioId: 'P-1001', tradeDate: '2025-05-23', settlementDate: '2025-05-27', type: 'BUY',      instrument: 'Apple Inc.',    instrumentId: 'AAPL',   quantity: 150,   price: 195.42, currency: 'USD', amountChf: -26423.70,  account: 'Personal 12345678',     status: 'SETTLED' },
-  { id: 'TX-2', portfolioId: 'P-1001', tradeDate: '2025-05-22', settlementDate: '2025-05-26', type: 'SELL',     instrument: 'Nestlé SA',     instrumentId: 'NESN',   quantity: 200,   price: 92.18,  currency: 'CHF', amountChf: 18436.00,   account: 'Personal 12345678',     status: 'SETTLED' },
-  { id: 'TX-3', portfolioId: 'P-1001', tradeDate: '2025-05-20', settlementDate: '2025-05-20', type: 'DIVIDEND', instrument: 'Novartis AG',   instrumentId: 'NOVN',   quantity: null,  price: null,   currency: 'CHF', amountChf: 246.80,     account: 'Personal 12345678',     status: 'BOOKED'  },
-  { id: 'TX-4', portfolioId: 'P-1002', tradeDate: '2025-05-21', settlementDate: '2025-05-25', type: 'BUY',      instrument: 'Alphabet Inc.', instrumentId: 'GOOGL',  quantity: 80,    price: 175.80, currency: 'USD', amountChf: -12825.98,  account: 'Growth 98765432',       status: 'SETTLED' },
-  { id: 'TX-5', portfolioId: 'P-1003', tradeDate: '2025-05-19', settlementDate: '2025-05-23', type: 'BUY',      instrument: 'Swiss Conf.',   instrumentId: 'BOND-1', quantity: 2000,  price: 98.23,  currency: 'CHF', amountChf: -196460.00, account: 'Preservation 11223344', status: 'SETTLED' },
+  { id:'TX-1',portfolioId:'P-1001',tradeDate:'2025-05-23',settlementDate:'2025-05-27',type:'BUY',     instrument:'Apple Inc.',   instrumentId:'AAPL',  quantity:150, price:195.42,currency:'USD',amountChf:-26423.70,account:'Personal 12345678',    status:'SETTLED'},
+  { id:'TX-2',portfolioId:'P-1001',tradeDate:'2025-05-22',settlementDate:'2025-05-26',type:'SELL',    instrument:'Nestlé SA',    instrumentId:'NESN',  quantity:200, price:92.18, currency:'CHF',amountChf:18436.00,  account:'Personal 12345678',    status:'SETTLED'},
+  { id:'TX-3',portfolioId:'P-1001',tradeDate:'2025-05-20',settlementDate:'2025-05-20',type:'DIVIDEND',instrument:'Novartis AG',  instrumentId:'NOVN',  quantity:null,price:null,  currency:'CHF',amountChf:246.80,    account:'Personal 12345678',    status:'BOOKED' },
+  { id:'TX-4',portfolioId:'P-1002',tradeDate:'2025-05-21',settlementDate:'2025-05-25',type:'BUY',     instrument:'Alphabet Inc.',instrumentId:'GOOGL', quantity:80,  price:175.80,currency:'USD',amountChf:-12825.98,account:'Growth 98765432',      status:'SETTLED'},
+  { id:'TX-5',portfolioId:'P-1003',tradeDate:'2025-05-19',settlementDate:'2025-05-23',type:'BUY',     instrument:'Swiss Conf.', instrumentId:'BOND-1',quantity:2000,price:98.23, currency:'CHF',amountChf:-196460,   account:'Preservation 11223344',status:'SETTLED'},
 ];
 
-// ── GBM price simulation ──────────────────────────────────────────────────────
 function gbmTick(price, vol) {
-  const dt = 3 / (252 * 8 * 3600);
-  const z = Math.sqrt(-2 * Math.log(Math.random())) * Math.cos(2 * Math.PI * Math.random());
-  return price * Math.exp(-0.5 * vol * vol * dt + vol * Math.sqrt(dt) * z);
+  const dt = 3/(252*8*3600);
+  const z = Math.sqrt(-2*Math.log(Math.random()))*Math.cos(2*Math.PI*Math.random());
+  return price*Math.exp(-0.5*vol*vol*dt+vol*Math.sqrt(dt)*z);
 }
 
-let priceHistory = {};
-let tradeCounter = 100;
-
-// ── Derived data ──────────────────────────────────────────────────────────────
 function getLivePositions(portfolioId) {
-  return positionBase
-    .filter(p => p.portfolioId === portfolioId)
-    .map(p => {
-      const inst = instruments[p.instrumentId];
-      const fxRate = fx[inst.currency] || 1;
-      const marketValueChf = p.quantity * inst.price * fxRate;
-      const costChf = p.quantity * (costBasis[p.instrumentId] || inst.price) * fxRate;
-      return {
-        id: p.id, portfolioId: p.portfolioId, instrumentId: p.instrumentId,
-        name: inst.name, isin: inst.isin, assetClass: p.assetClass,
-        currency: inst.currency, quantity: p.quantity,
-        price: +inst.price.toFixed(4),
-        marketValueChf: +marketValueChf.toFixed(2),
-        unrealizedPlChf: +(marketValueChf - costChf).toFixed(2),
-      };
-    });
+  return positionBase.filter(p=>p.portfolioId===portfolioId).map(p=>{
+    const inst=instruments[p.instrumentId], fxRate=fx[inst.currency]||1;
+    const mv=p.quantity*inst.price*fxRate, cost=p.quantity*(costBasis[p.instrumentId]||inst.price)*fxRate;
+    return { id:p.id,portfolioId:p.portfolioId,instrumentId:p.instrumentId,name:inst.name,isin:inst.isin,assetClass:p.assetClass,currency:inst.currency,quantity:p.quantity,price:+inst.price.toFixed(4),marketValueChf:+mv.toFixed(2),unrealizedPlChf:+(mv-cost).toFixed(2) };
+  });
 }
 
 function getLivePortfolio(portfolioId) {
-  const meta = portfolioMeta[portfolioId];
-  if (!meta) return null;
-  const positions = getLivePositions(portfolioId);
-  const investedValue = positions.reduce((s, p) => s + p.marketValueChf, 0);
-  const totalValue = investedValue + meta.cash;
-  const prevValue = totalValue * 0.9801;
-  const byClass = {};
-  for (const p of positions) byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
-  byClass['Cash & Money Market'] = (byClass['Cash & Money Market'] || 0) + meta.cash;
-  const allocation = Object.entries(byClass).map(([assetClass, valueChf]) => ({
-    assetClass, pct: +((valueChf / totalValue) * 100).toFixed(1), valueChf: +valueChf.toFixed(0),
-  }));
-  return {
-    id: portfolioId, name: meta.name, mandate: meta.mandate,
-    baseCurrency: meta.currency, color: meta.color,
-    value: +totalValue.toFixed(2),
-    dayChange: +(totalValue - prevValue).toFixed(2),
-    dayChangePct: +((totalValue - prevValue) / prevValue * 100).toFixed(2),
-    allocation,
-  };
+  const meta=portfolioMeta[portfolioId]; if(!meta)return null;
+  const positions=getLivePositions(portfolioId);
+  const investedValue=positions.reduce((s,p)=>s+p.marketValueChf,0);
+  const totalValue=investedValue+meta.cash, prevValue=totalValue*0.9801;
+  const byClass={};
+  for(const p of positions) byClass[p.assetClass]=(byClass[p.assetClass]||0)+p.marketValueChf;
+  byClass['Cash & Money Market']=(byClass['Cash & Money Market']||0)+meta.cash;
+  const allocation=Object.entries(byClass).map(([assetClass,valueChf])=>({assetClass,pct:+((valueChf/totalValue)*100).toFixed(1),valueChf:+valueChf.toFixed(0)}));
+  return { id:portfolioId,name:meta.name,mandate:meta.mandate,baseCurrency:meta.currency,color:meta.color,value:+totalValue.toFixed(2),dayChange:+(totalValue-prevValue).toFixed(2),dayChangePct:+((totalValue-prevValue)/prevValue*100).toFixed(2),allocation };
 }
 
-function getAllPortfolios() {
-  return Object.keys(portfolioMeta).map(id => getLivePortfolio(id));
+function getAllPortfolios(){ return Object.keys(portfolioMeta).map(id=>getLivePortfolio(id)); }
+function getMarketOverview(){ return Object.entries(indices).map(([name,idx])=>({name,value:+idx.value.toFixed(2),changePct:+(((idx.value/(idx.value/1.005))-1)*100).toFixed(2)})); }
+function getAggregatedDashboard(){
+  const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0),totalDayChange=portfolios.reduce((s,p)=>s+p.dayChange,0);
+  const portfolioAllocation=portfolios.map(p=>({portfolioId:p.id,name:p.name,mandate:p.mandate,color:p.color,value:p.value,pct:+((p.value/totalAum)*100).toFixed(1)}));
+  const allPositions=Object.keys(portfolioMeta).flatMap(id=>getLivePositions(id)),byClass={};
+  for(const p of allPositions) byClass[p.assetClass]=(byClass[p.assetClass]||0)+p.marketValueChf;
+  byClass['Cash & Money Market']=(byClass['Cash & Money Market']||0)+Object.values(portfolioMeta).reduce((s,m)=>s+m.cash,0);
+  const assetAllocation=Object.entries(byClass).map(([assetClass,valueChf])=>({assetClass,pct:+((valueChf/totalAum)*100).toFixed(1),valueChf:+valueChf.toFixed(0)}));
+  return { totalAum:+totalAum.toFixed(2),totalDayChange:+totalDayChange.toFixed(2),totalDayChangePct:+((totalDayChange/(totalAum-totalDayChange))*100).toFixed(2),portfolios,portfolioAllocation,assetAllocation,marketOverview:getMarketOverview(),recentActivity:transactions.slice(0,5),unreadNotifications:0 };
 }
 
-function getAggregatedDashboard() {
-  const portfolios = getAllPortfolios();
-  const totalAum = portfolios.reduce((s, p) => s + p.value, 0);
-  const totalDayChange = portfolios.reduce((s, p) => s + p.dayChange, 0);
-  const portfolioAllocation = portfolios.map(p => ({
-    portfolioId: p.id, name: p.name, mandate: p.mandate, color: p.color,
-    value: p.value, pct: +((p.value / totalAum) * 100).toFixed(1),
-  }));
-  const allPositions = Object.keys(portfolioMeta).flatMap(id => getLivePositions(id));
-  const byClass = {};
-  for (const p of allPositions) byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
-  const totalCash = Object.values(portfolioMeta).reduce((s, m) => s + m.cash, 0);
-  byClass['Cash & Money Market'] = (byClass['Cash & Money Market'] || 0) + totalCash;
-  const assetAllocation = Object.entries(byClass).map(([assetClass, valueChf]) => ({
-    assetClass, pct: +((valueChf / totalAum) * 100).toFixed(1), valueChf: +valueChf.toFixed(0),
-  }));
-  return {
-    totalAum: +totalAum.toFixed(2),
-    totalDayChange: +totalDayChange.toFixed(2),
-    totalDayChangePct: +((totalDayChange / (totalAum - totalDayChange)) * 100).toFixed(2),
-    portfolios, portfolioAllocation, assetAllocation,
-    marketOverview: getMarketOverview(),
-    recentActivity: transactions.slice(0, 5),
-    unreadNotifications: notifications.filter(n => !n.read).length,
-  };
-}
-
-function getMarketOverview() {
-  return Object.entries(indices).map(([name, idx]) => ({
-    name, value: +idx.value.toFixed(2),
-    changePct: +(((idx.value / (idx.value / 1.005)) - 1) * 100).toFixed(2),
-  }));
-}
-
-// ── FCM token persistence ─────────────────────────────────────────────────────
-const TOKENS_FILE = '/tmp/fcm_tokens.json';
-let fcmTokens = {};
-try {
-  if (fs.existsSync(TOKENS_FILE)) fcmTokens = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-  console.log(`Loaded ${Object.keys(fcmTokens).length} FCM token(s)`);
-} catch (e) { console.warn('Could not load FCM tokens'); }
-
-function saveTokens() {
-  try { fs.writeFileSync(TOKENS_FILE, JSON.stringify(fcmTokens)); } catch (e) {}
-}
+// ── FCM persistence ───────────────────────────────────────────────────────────
+const TOKENS_FILE='/tmp/fcm_tokens.json';
+let fcmTokens={};
+try{ if(fs.existsSync(TOKENS_FILE)) fcmTokens=JSON.parse(fs.readFileSync(TOKENS_FILE,'utf-8')); console.log(`Loaded ${Object.keys(fcmTokens).length} FCM token(s)`); }catch(e){}
+function saveTokens(){ try{fs.writeFileSync(TOKENS_FILE,JSON.stringify(fcmTokens));}catch(e){} }
 
 // ── In-memory stores ──────────────────────────────────────────────────────────
-const authChallenges = {};
-const beneficiaries = {};
+const authChallenges={}, beneficiaries={}, payments={}, connectedClients=new Set();
+function broadcast(payload){ const msg=JSON.stringify(payload); for(const ws of connectedClients) if(ws.readyState===1) ws.send(msg); }
 
-// ── Simulation loop ───────────────────────────────────────────────────────────
-const connectedClients = new Set();
-
-function broadcast(payload) {
-  const msg = JSON.stringify(payload);
-  for (const ws of connectedClients) if (ws.readyState === 1) ws.send(msg);
-}
-
-function maybeGenerateTrade() {
-  if (Math.random() > 0.12) return null;
-  const portfolioIds = Object.keys(portfolioMeta);
-  const portfolioId = portfolioIds[Math.floor(Math.random() * portfolioIds.length)];
-  const instIds = Object.keys(instruments).filter(i => !i.startsWith('BOND'));
-  const instrumentId = instIds[Math.floor(Math.random() * instIds.length)];
-  const inst = instruments[instrumentId];
-  const type = Math.random() > 0.5 ? 'BUY' : 'SELL';
-  const quantity = Math.floor(Math.random() * 50) + 10;
-  const amountChf = (type === 'BUY' ? -1 : 1) * quantity * inst.price * (fx[inst.currency] || 1);
-  const tx = {
-    id: `TX-${++tradeCounter}`, portfolioId,
-    tradeDate: new Date().toISOString().split('T')[0],
-    settlementDate: new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0],
-    type, instrument: inst.name, instrumentId, quantity,
-    price: +inst.price.toFixed(4), currency: inst.currency,
-    amountChf: +amountChf.toFixed(2),
-    account: portfolioMeta[portfolioId].name, status: 'PENDING',
-  };
-  transactions.unshift(tx);
-  if (transactions.length > 50) transactions.pop();
-  return tx;
-}
-
-setInterval(() => {
-  // Tick prices
-  const priceChanges = [];
-  for (const [id, inst] of Object.entries(instruments)) {
-    const prev = inst.price;
-    inst.price = gbmTick(inst.price, inst.vol);
-    priceChanges.push({ instrumentId: id, prev: +prev.toFixed(4), price: +inst.price.toFixed(4), currency: inst.currency });
-    if (!priceHistory[id]) priceHistory[id] = [];
-    priceHistory[id].push(+inst.price.toFixed(4));
-    if (priceHistory[id].length > 60) priceHistory[id].shift();
-  }
-  for (const idx of Object.values(indices)) idx.value = gbmTick(idx.value, idx.vol);
-
-  const portfolios = getAllPortfolios();
-  const totalAum = portfolios.reduce((s, p) => s + p.value, 0);
-
-  broadcast({
-    eventId: 'EVT-' + Date.now(), source: 'MARKET_DATA',
-    eventType: 'PRICE_UPDATED', occurredAt: now(),
-    payload: { prices: priceChanges, portfolios, totalAum: +totalAum.toFixed(2), marketOverview: getMarketOverview() },
-  });
-
-  const trade = maybeGenerateTrade();
-  if (trade) {
-    broadcast({ eventId: 'EVT-' + Date.now(), source: 'AVALOQ_MOCK', eventType: 'TRADE_EXECUTED', occurredAt: now(), payload: { trade } });
-  }
-}, 3000);
+// ── Simulation ────────────────────────────────────────────────────────────────
+setInterval(()=>{
+  const priceChanges=[];
+  for(const [id,inst] of Object.entries(instruments)){ const prev=inst.price; inst.price=gbmTick(inst.price,inst.vol); priceChanges.push({instrumentId:id,prev:+prev.toFixed(4),price:+inst.price.toFixed(4),currency:inst.currency}); }
+  for(const idx of Object.values(indices)) idx.value=gbmTick(idx.value,idx.vol);
+  const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0);
+  broadcast({eventId:'EVT-'+Date.now(),source:'MARKET_DATA',eventType:'PRICE_UPDATED',occurredAt:now(),payload:{prices:priceChanges,portfolios,totalAum:+totalAum.toFixed(2),marketOverview:getMarketOverview()}});
+},3000);
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
-app.post('/api/v1/auth/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ error: { code: 'AUTH_FAILED', message: 'Invalid credentials' } });
-  const token = Buffer.from(JSON.stringify({ userId: user.id, role: user.role })).toString('base64');
-  res.json({ accessToken: token, tokenType: 'Bearer', expiresIn: 3600, user: { id: user.id, name: user.name, role: user.role } });
+app.post('/api/v1/auth/login',(req,res)=>{
+  const{username,password}=req.body, user=users.find(u=>u.username===username&&u.password===password);
+  if(!user) return res.status(401).json({error:{code:'AUTH_FAILED',message:'Invalid credentials'}});
+  const token=Buffer.from(JSON.stringify({userId:user.id,role:user.role})).toString('base64');
+  res.json({accessToken:token,tokenType:'Bearer',expiresIn:3600,user:{id:user.id,name:user.name,role:user.role}});
 });
 
-app.get('/api/v1/auth/session', authenticate, (req, res) => {
-  res.json(users.find(u => u.id === req.user.userId));
+app.get('/api/v1/clients/me/config',authenticate,(req,res)=>{
+  const config=clientConfig[req.user.userId];
+  res.json({data:config||{coSignThreshold:null,rmThreshold:null,coSignerId:null,coSignerName:null}});
 });
 
-app.post('/auth/fcm-token', authenticate, (req, res) => {
-  const { fcmToken } = req.body;
-  if (!fcmToken) return res.status(400).json({ error: 'Missing fcmToken' });
-  fcmTokens[req.user.userId] = fcmToken;
-  saveTokens();
+app.post('/auth/fcm-token',authenticate,(req,res)=>{
+  const{fcmToken}=req.body; if(!fcmToken) return res.status(400).json({error:'Missing fcmToken'});
+  fcmTokens[req.user.userId]=fcmToken; saveTokens();
   console.log(`FCM token registered for user ${req.user.userId}`);
-  res.json({ success: true });
+  res.json({success:true});
 });
 
-app.post('/auth/web-challenge', async (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ error: { code: 'AUTH_FAILED', message: 'Invalid credentials' } });
-  const fcmToken = fcmTokens[user.id];
-  if (!fcmToken) return res.status(400).json({ error: { code: 'NO_MOBILE_DEVICE', message: 'No mobile device registered. Please log in via the mobile app first.' } });
-  const challengeId = 'CHG-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-  const expiresAt = Date.now() + 3 * 60 * 1000;
-  authChallenges[challengeId] = {
-    userId: user.id, status: 'PENDING', expiresAt,
-    ipAddress: req.headers['x-forwarded-for'] || req.ip || 'Unknown',
-    createdAt: now(),
-  };
-  await sendPush(fcmToken, {
-    title: '🔐 New login request',
-    body: 'Someone is trying to log into your account. Tap to approve or reject.',
-    data: { type: 'WEB_LOGIN_CHALLENGE', challengeId, userName: user.name, ipAddress: authChallenges[challengeId].ipAddress, timestamp: authChallenges[challengeId].createdAt },
-  });
-  res.json({ challengeId, expiresAt });
+app.post('/auth/web-challenge',async(req,res)=>{
+  const{username,password}=req.body, user=users.find(u=>u.username===username&&u.password===password);
+  if(!user) return res.status(401).json({error:{code:'AUTH_FAILED',message:'Invalid credentials'}});
+  const fcmToken=fcmTokens[user.id];
+  if(!fcmToken) return res.status(400).json({error:{code:'NO_MOBILE_DEVICE',message:'No mobile device registered. Please log in via the mobile app first.'}});
+  const challengeId='CHG-'+Date.now()+'-'+Math.random().toString(36).substr(2,9), expiresAt=Date.now()+3*60*1000;
+  authChallenges[challengeId]={userId:user.id,status:'PENDING',expiresAt,ipAddress:req.headers['x-forwarded-for']||req.ip||'Unknown',createdAt:now()};
+  await sendPush(fcmToken,{title:'🔐 New login request',body:'Someone is trying to log into your account. Tap to approve or reject.',data:{type:'WEB_LOGIN_CHALLENGE',challengeId,userName:user.name,ipAddress:authChallenges[challengeId].ipAddress,timestamp:authChallenges[challengeId].createdAt}});
+  res.json({challengeId,expiresAt});
 });
 
-app.get('/auth/web-challenge/:id/status', (req, res) => {
-  const c = authChallenges[req.params.id];
-  if (!c) return res.status(404).json({ error: 'Not found' });
-  if (Date.now() > c.expiresAt) c.status = 'EXPIRED';
-  if (c.status === 'APPROVED') {
-    const user = users.find(u => u.id === c.userId);
-    const token = Buffer.from(JSON.stringify({ userId: user.id, role: user.role })).toString('base64');
+app.get('/auth/web-challenge/:id/status',(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(Date.now()>c.expiresAt) c.status='EXPIRED';
+  if(c.status==='APPROVED'){
+    const user=users.find(u=>u.id===c.userId), token=Buffer.from(JSON.stringify({userId:user.id,role:user.role})).toString('base64');
     delete authChallenges[req.params.id];
-    return res.json({ status: 'APPROVED', accessToken: token, user: { id: user.id, name: user.name, role: user.role } });
+    return res.json({status:'APPROVED',accessToken:token,user:{id:user.id,name:user.name,role:user.role}});
   }
-  res.json({ status: c.status, expiresAt: c.expiresAt });
+  res.json({status:c.status,expiresAt:c.expiresAt});
 });
 
-app.post('/auth/web-challenge/:id/approve', authenticate, (req, res) => {
-  const c = authChallenges[req.params.id];
-  if (!c) return res.status(404).json({ error: 'Not found' });
-  if (Date.now() > c.expiresAt) return res.status(400).json({ error: 'Expired' });
-  if (c.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
-  c.status = 'APPROVED';
-  res.json({ success: true });
+app.post('/auth/web-challenge/:id/approve',authenticate,(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(Date.now()>c.expiresAt) return res.status(400).json({error:'Expired'});
+  if(c.userId!==req.user.userId) return res.status(403).json({error:'Forbidden'});
+  c.status='APPROVED'; res.json({success:true});
 });
 
-app.post('/auth/web-challenge/:id/reject', authenticate, (req, res) => {
-  const c = authChallenges[req.params.id];
-  if (!c) return res.status(404).json({ error: 'Not found' });
-  if (c.userId !== req.user.userId) return res.status(403).json({ error: 'Forbidden' });
-  c.status = 'REJECTED';
-  delete authChallenges[req.params.id];
-  res.json({ success: true });
+app.post('/auth/web-challenge/:id/reject',authenticate,(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(c.userId!==req.user.userId) return res.status(403).json({error:'Forbidden'});
+  c.status='REJECTED'; delete authChallenges[req.params.id]; res.json({success:true});
 });
 
-// ── Dashboard & portfolio endpoints ───────────────────────────────────────────
-app.get('/health', (req, res) => res.json({
-  status: 'ok', version: SERVER_VERSION, service: 'private-banking-pi',
-  firebase: firebaseInitialized, uptime: Math.floor(process.uptime()), timestamp: now(),
-  git: { commit: process.env.GIT_COMMIT?.slice(0, 7) || 'local', branch: process.env.GIT_BRANCH || 'local' },
-}));
+// ── Portfolio endpoints ───────────────────────────────────────────────────────
+app.get('/health',(req,res)=>res.json({status:'ok',version:SERVER_VERSION,service:'private-banking-pi',firebase:firebaseInitialized,uptime:Math.floor(process.uptime()),timestamp:now()}));
+app.get('/bff/mobile/dashboard',(req,res)=>res.json(response(getAggregatedDashboard())));
+app.get('/portfolios',(req,res)=>res.json(response(getAllPortfolios())));
+app.get('/portfolios/:id',(req,res)=>res.json(response(getLivePortfolio(req.params.id))));
+app.get('/portfolios/:id/positions',(req,res)=>{
+  const positions=getLivePositions(req.params.id), portfolio=getLivePortfolio(req.params.id);
+  if(!portfolio) return res.status(404).json({error:'Not found'});
+  res.json(response(positions.map(p=>({...p,weightPct:+((p.marketValueChf/portfolio.value)*100).toFixed(2)}))));
+});
+app.get('/portfolios/:id/performance',(req,res)=>res.json(response({portfolioId:req.params.id,twr:{mtd:1.25,ytd:7.62,oneYear:12.35,threeYearAnnualized:8.91},mwr:{ytd:7.10,sinceInception:7.85},benchmark:{name:'MSCI World',ytd:5.18},excessReturnYtd:2.44})));
+app.get('/portfolios/:id/allocation',(req,res)=>res.json(response(getLivePortfolio(req.params.id)?.allocation||[])));
+app.get('/portfolios/:id/profitability',(req,res)=>{
+  const positions=getLivePositions(req.params.id), unrealized=positions.reduce((s,p)=>s+p.unrealizedPlChf,0);
+  res.json(response({portfolioId:req.params.id,realizedPlChf:245678.90,unrealizedPlChf:+unrealized.toFixed(2),incomeChf:78342.15,feesChf:-23456.78,totalNetProfitabilityChf:+(unrealized+245678.90+78342.15-23456.78).toFixed(2)}));
+});
+app.get('/portfolios/:id/cash',(req,res)=>res.json(response({portfolioId:req.params.id,totalCashChf:2458320.45,availableToInvestChf:1985410.22,pendingChf:312450.13,restrictedChf:160460.10,currencies:[{currency:'CHF',total:1250450.10,valueChf:1250450.10,pct:50.9},{currency:'USD',total:895210.35,valueChf:816422.71,pct:33.2},{currency:'EUR',total:210430.80,valueChf:207640.77,pct:8.4}]})));
+app.get('/transactions',(req,res)=>{ const{portfolioId}=req.query; res.json(response(portfolioId?transactions.filter(t=>t.portfolioId===portfolioId):transactions)); });
+app.get('/marketdata/indices',(req,res)=>res.json(response(getMarketOverview())));
+app.get('/notifications',(req,res)=>res.json(response([])));
 
-app.get('/bff/mobile/dashboard', (req, res) => res.json(response(getAggregatedDashboard())));
-app.get('/portfolios', (req, res) => res.json(response(getAllPortfolios())));
-app.get('/portfolios/:id', (req, res) => res.json(response(getLivePortfolio(req.params.id))));
-app.get('/portfolios/:id/positions', (req, res) => {
-  const positions = getLivePositions(req.params.id);
-  const portfolio = getLivePortfolio(req.params.id);
-  if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
-  res.json(response(positions.map(p => ({ ...p, weightPct: +((p.marketValueChf / portfolio.value) * 100).toFixed(2) }))));
-});
-app.get('/portfolios/:id/performance', (req, res) => res.json(response({
-  portfolioId: req.params.id,
-  twr: { mtd: 1.25, ytd: 7.62, oneYear: 12.35, threeYearAnnualized: 8.91 },
-  mwr: { ytd: 7.10, sinceInception: 7.85 },
-  benchmark: { name: 'MSCI World', ytd: 5.18 },
-  excessReturnYtd: 2.44,
-})));
-app.get('/portfolios/:id/allocation', (req, res) => {
-  const p = getLivePortfolio(req.params.id);
-  res.json(response(p?.allocation || []));
-});
-app.get('/portfolios/:id/profitability', (req, res) => {
-  const positions = getLivePositions(req.params.id);
-  const unrealized = positions.reduce((s, p) => s + p.unrealizedPlChf, 0);
-  res.json(response({ portfolioId: req.params.id, realizedPlChf: 245678.90, unrealizedPlChf: +unrealized.toFixed(2), incomeChf: 78342.15, feesChf: -23456.78, totalNetProfitabilityChf: +(unrealized + 245678.90 + 78342.15 - 23456.78).toFixed(2) }));
-});
-app.get('/portfolios/:id/cash', (req, res) => res.json(response({
-  portfolioId: req.params.id,
-  totalCashChf: 2458320.45, availableToInvestChf: 1985410.22, pendingChf: 312450.13, restrictedChf: 160460.10,
-  currencies: [
-    { currency: 'CHF', total: 1250450.10, valueChf: 1250450.10, pct: 50.9 },
-    { currency: 'USD', total: 895210.35,  valueChf: 816422.71,  pct: 33.2 },
-    { currency: 'EUR', total: 210430.80,  valueChf: 207640.77,  pct: 8.4  },
-  ],
-})));
+// ── Beneficiaries ─────────────────────────────────────────────────────────────
+app.get('/beneficiaries',authenticate,(req,res)=>res.json({data:beneficiaries[req.user.userId]||[]}));
 
-// ── Positions, transactions, documents, notifications ─────────────────────────
-app.get('/positions/:id', (req, res) => {
-  const all = Object.keys(portfolioMeta).flatMap(id => getLivePositions(id));
-  res.json(response(all.find(p => p.id === req.params.id) || null));
+app.post('/beneficiaries',authenticate,async(req,res)=>{
+  const{beneficiaryName,iban,bankName,bankCountry,currency}=req.body;
+  if(!beneficiaryName||!iban) return res.status(400).json({error:'Missing required fields'});
+  const user=users.find(u=>u.id===req.user.userId), beneficiaryId='BEN-'+Date.now();
+  if(!beneficiaries[req.user.userId]) beneficiaries[req.user.userId]=[];
+  const beneficiary={id:beneficiaryId,beneficiaryName,iban,bankName:bankName||'',bankCountry:bankCountry||'',currency:currency||'CHF',status:'PENDING_APPROVAL',requestedAt:now(),customerId:req.user.userId,customerName:user.name};
+  beneficiaries[req.user.userId].push(beneficiary);
+  try{
+    const proc=await flowable('POST','/runtime/process-instances',{processDefinitionKey:'beneficiaryRegistration',businessKey:beneficiaryId,variables:[
+      {name:'beneficiaryId',value:beneficiaryId,type:'string'},{name:'beneficiaryName',value:beneficiaryName,type:'string'},
+      {name:'iban',value:iban,type:'string'},{name:'bankName',value:bankName||'',type:'string'},
+      {name:'bankCountry',value:bankCountry||'',type:'string'},{name:'currency',value:currency||'CHF',type:'string'},
+      {name:'customerId',value:req.user.userId,type:'string'},{name:'customerName',value:user.name,type:'string'},
+      {name:'requestedAt',value:now(),type:'string'},
+    ]});
+    beneficiary.processInstanceId=proc.id;
+    console.log(`Beneficiary process started: ${proc.id}`);
+  }catch(e){console.error('Flowable error:',e.message);}
+  res.status(201).json({data:beneficiary});
 });
-app.get('/transactions', (req, res) => {
-  const { portfolioId } = req.query;
-  res.json(response(portfolioId ? transactions.filter(t => t.portfolioId === portfolioId) : transactions));
+
+app.get('/beneficiaries/:id',authenticate,(req,res)=>{
+  const b=(beneficiaries[req.user.userId]||[]).find(b=>b.id===req.params.id);
+  if(!b) return res.status(404).json({error:'Not found'});
+  res.json({data:b});
 });
-app.get('/documents', (req, res) => res.json(response(documents)));
-app.get('/documents/:id', (req, res) => res.json(response(documents.find(d => d.id === req.params.id) || null)));
-app.post('/documents/:id/acknowledge', (req, res) => res.json(response({ documentId: req.params.id, acknowledged: true, acknowledgedAt: now() })));
-app.get('/notifications', (req, res) => res.json(response(notifications)));
-app.post('/notifications/:id/read', (req, res) => res.json(response({ notificationId: req.params.id, read: true })));
-app.get('/marketdata/quotes/:instrumentId', (req, res) => {
-  const inst = instruments[req.params.instrumentId];
-  if (!inst) return res.status(404).json({ error: 'Not found' });
-  res.json(response({ instrumentId: req.params.instrumentId, price: +inst.price.toFixed(4), currency: inst.currency, history: priceHistory[req.params.instrumentId] || [], timestamp: now() }));
+
+app.delete('/beneficiaries/:id',authenticate,(req,res)=>{
+  const list=beneficiaries[req.user.userId]||[], idx=list.findIndex(b=>b.id===req.params.id);
+  if(idx===-1) return res.status(404).json({error:'Not found'});
+  list.splice(idx,1); res.json({success:true});
 });
-app.get('/marketdata/indices', (req, res) => res.json(response(getMarketOverview())));
-app.get('/research', (req, res) => res.json(response([
-  { id: 'R-1', title: 'Weekly Market Outlook',  provider: 'Research Desk', date: '2025-05-23' },
-  { id: 'R-2', title: 'Swiss Equities Update',  provider: 'Research Desk', date: '2025-05-22' },
-])));
 
 // ── Payments ──────────────────────────────────────────────────────────────────
-app.post('/payments/preview', (req, res) => res.json(response({ feesChf: 5.00, requiresApproval: true, status: 'PREVIEW_OK' })));
-app.post('/payments', (req, res) => res.status(201).json(response({ paymentId: 'PAY-' + Date.now(), status: 'PENDING_APPROVAL', ...req.body })));
-app.get('/payments/:id/status', (req, res) => res.json(response({ paymentId: req.params.id, status: 'PENDING_SECOND_APPROVAL' })));
-
-// ── Credit ────────────────────────────────────────────────────────────────────
-app.get('/credit/lombard/capacity', (req, res) => {
-  const totalAum = getAllPortfolios().reduce((s, p) => s + p.value, 0);
-  const facility = totalAum * 0.71 * 0.80;
-  res.json(response({ portfolioValueChf: +totalAum.toFixed(2), approvedFacilityChf: +facility.toFixed(2), outstandingLoanChf: 2500000, availableCreditChf: +(facility - 2500000).toFixed(2), utilizationPct: +((2500000 / facility) * 100).toFixed(1) }));
-});
-app.post('/credit/lombard/simulations', (req, res) => res.json(response({ simulationId: 'SIM-' + Date.now(), requestedAmountChf: req.body.amountChf || 500000, estimatedAnnualInterestChf: 6250, postDrawdownUtilizationPct: 52.8, eligible: true })));
-
-// ── Beneficiary endpoints ─────────────────────────────────────────────────────
-app.get('/beneficiaries', authenticate, (req, res) => {
-  res.json({ data: beneficiaries[req.user.userId] || [] });
+app.get('/payments',authenticate,(req,res)=>{
+  const userPayments=Object.values(payments).filter(p=>p.customerId===req.user.userId||p.coSignerId===req.user.userId);
+  res.json({data:userPayments.sort((a,b)=>new Date(b.initiatedAt)-new Date(a.initiatedAt))});
 });
 
-app.post('/beneficiaries', authenticate, async (req, res) => {
-  const { beneficiaryName, iban, bankName, bankCountry, currency } = req.body;
-  if (!beneficiaryName || !iban) return res.status(400).json({ error: 'Missing required fields' });
-  const user = users.find(u => u.id === req.user.userId);
-  const beneficiaryId = 'BEN-' + Date.now();
-  if (!beneficiaries[req.user.userId]) beneficiaries[req.user.userId] = [];
-  const beneficiary = {
-    id: beneficiaryId, beneficiaryName, iban,
-    bankName: bankName || '', bankCountry: bankCountry || '', currency: currency || 'CHF',
-    status: 'PENDING_APPROVAL', requestedAt: now(),
-    customerId: req.user.userId, customerName: user.name,
+app.post('/payments',authenticate,async(req,res)=>{
+  const{beneficiaryId,amount,currency,reference,portfolioId}=req.body;
+  if(!beneficiaryId||!amount) return res.status(400).json({error:'Missing required fields'});
+  const user=users.find(u=>u.id===req.user.userId), config=clientConfig[req.user.userId];
+  const bList=beneficiaries[req.user.userId]||[], beneficiary=bList.find(b=>b.id===beneficiaryId&&b.status==='ACTIVE');
+  if(!beneficiary) return res.status(400).json({error:'Beneficiary not found or not active'});
+  const paymentId='PAY-'+Date.now(), amountNum=parseFloat(amount);
+  const coSignTh=config?.coSignThreshold||10000, rmTh=config?.rmThreshold||50000;
+  const payment={
+    id:paymentId,customerId:req.user.userId,customerName:user.name,
+    coSignerId:config?.coSignerId||null,coSignerName:config?.coSignerName||null,
+    beneficiaryId,beneficiaryName:beneficiary.beneficiaryName,iban:beneficiary.iban,bankName:beneficiary.bankName,
+    amount:amountNum,currency:currency||beneficiary.currency||'CHF',reference:reference||'',
+    portfolioId:portfolioId||user.portfolios?.[0]||'P-1001',status:'PENDING',
+    approvalPath:amountNum<=coSignTh?'STRAIGHT_THROUGH':amountNum<=rmTh?'CO_SIGNER':'CO_SIGNER_AND_RM',
+    initiatedAt:now(),
   };
-  beneficiaries[req.user.userId].push(beneficiary);
-  try {
-    const process = await flowable('POST', '/runtime/process-instances', {
-      processDefinitionKey: 'beneficiaryRegistration',
-      businessKey: beneficiaryId,
-      variables: [
-        { name: 'beneficiaryId',   value: beneficiaryId,         type: 'string' },
-        { name: 'beneficiaryName', value: beneficiaryName,        type: 'string' },
-        { name: 'iban',            value: iban,                   type: 'string' },
-        { name: 'bankName',        value: bankName || '',         type: 'string' },
-        { name: 'bankCountry',     value: bankCountry || '',      type: 'string' },
-        { name: 'currency',        value: currency || 'CHF',      type: 'string' },
-        { name: 'customerId',      value: req.user.userId,        type: 'string' },
-        { name: 'customerName',    value: user.name,              type: 'string' },
-        { name: 'requestedAt',     value: now(),                  type: 'string' },
-      ],
-    });
-    beneficiary.processInstanceId = process.id;
-    console.log(`Flowable process started: ${process.id}`);
-  } catch (e) {
-    console.error('Flowable error:', e.message);
+  payments[paymentId]=payment;
+  try{
+    const proc=await flowable('POST','/runtime/process-instances',{processDefinitionKey:'paymentApproval',businessKey:paymentId,variables:[
+      {name:'paymentId',value:paymentId,type:'string'},{name:'customerId',value:req.user.userId,type:'string'},
+      {name:'customerName',value:user.name,type:'string'},{name:'coSignerId',value:config?.coSignerId||'',type:'string'},
+      {name:'coSignerName',value:config?.coSignerName||'',type:'string'},{name:'beneficiaryId',value:beneficiaryId,type:'string'},
+      {name:'beneficiaryName',value:beneficiary.beneficiaryName,type:'string'},{name:'iban',value:beneficiary.iban,type:'string'},
+      {name:'bankName',value:beneficiary.bankName||'',type:'string'},{name:'amount',value:amountNum,type:'double'},
+      {name:'currency',value:payment.currency,type:'string'},{name:'reference',value:payment.reference,type:'string'},
+      {name:'portfolioId',value:payment.portfolioId,type:'string'},
+    ]});
+    payment.processInstanceId=proc.id;
+    console.log(`Payment process started: ${proc.id} for ${paymentId} (${amountNum} ${payment.currency})`);
+  }catch(e){console.error('Payment Flowable error:',e.message);}
+  if(amountNum>coSignTh&&config?.coSignerId){
+    const tok=fcmTokens[config.coSignerId];
+    if(tok) await sendPush(tok,{title:'💳 Payment Approval Required',body:`${user.name} wants to send ${payment.currency} ${amountNum.toLocaleString()} to ${beneficiary.beneficiaryName}`,data:{type:'PAYMENT_CO_SIGN',paymentId,customerId:req.user.userId,amount:String(amountNum),currency:payment.currency,beneficiaryName:beneficiary.beneficiaryName,iban:beneficiary.iban,customerName:user.name,reference:payment.reference}});
   }
-  res.status(201).json({ data: beneficiary });
+  res.status(201).json({data:payment});
 });
 
-app.get('/beneficiaries/:id', authenticate, (req, res) => {
-  const list = beneficiaries[req.user.userId] || [];
-  const b = list.find(b => b.id === req.params.id);
-  if (!b) return res.status(404).json({ error: 'Not found' });
-  res.json({ data: b });
-});
-
-app.delete('/beneficiaries/:id', authenticate, (req, res) => {
-  const list = beneficiaries[req.user.userId] || [];
-  const idx = list.findIndex(b => b.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  list.splice(idx, 1);
-  res.json({ success: true });
-});
-
-// ── Flowable task proxy ───────────────────────────────────────────────────────
-app.get('/workflow/tasks', authenticate, async (req, res) => {
-  try {
-    const data = await flowable('GET', '/runtime/tasks?processDefinitionKey=beneficiaryRegistration&size=50');
-    const tasks = await Promise.all((data.data || []).map(async (task) => {
-      try {
-        // Fetch from process instance — variables are process-scoped not task-scoped
-        const vars = await flowable('GET', `/runtime/process-instances/${task.processInstanceId}/variables`);
-        const varMap = {};
-        (vars || []).forEach(v => varMap[v.name] = v.value);
-        return { ...task, variables: varMap };
-      } catch (e) {
-        console.error('Failed to get vars for task', task.id, e.message);
-        return { ...task, variables: {} };
-      }
+app.get('/payments/pending/cosign',authenticate,async(req,res)=>{
+  try{
+    const data=await flowable('GET',`/runtime/tasks?assignee=${req.user.userId}&processDefinitionKey=paymentApproval&size=50`);
+    const tasks=await Promise.all((data.data||[]).map(async task=>{
+      try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{taskId:task.id,...varMap}; }
+      catch{ return{taskId:task.id}; }
     }));
-    res.json({ data: tasks, total: data.total });
-  } catch (e) {
-    console.error('Flowable tasks error:', e.message);
-    res.status(502).json({ error: 'Flowable unavailable', detail: e.message });
-  }
+    res.json({data:tasks});
+  }catch(e){res.status(502).json({error:'Flowable unavailable'});}
 });
 
-app.get('/workflow/tasks/:taskId', authenticate, async (req, res) => {
-  try {
-    const task = await flowable('GET', `/runtime/tasks/${req.params.taskId}`);
-    // Fetch variables from process instance scope
-    const vars = await flowable('GET', `/runtime/process-instances/${task.processInstanceId}/variables`);
-    const varMap = {};
-    (vars || []).forEach(v => varMap[v.name] = v.value);
-    res.json({ data: { ...task, variables: varMap } });
-  } catch (e) {
-    console.error('Task detail error:', e.message);
-    res.status(502).json({ error: 'Flowable unavailable' });
-  }
+app.post('/payments/:paymentId/cosign',authenticate,async(req,res)=>{
+  const{decision,comment}=req.body, payment=payments[req.params.paymentId];
+  if(!payment) return res.status(404).json({error:'Payment not found'});
+  if(payment.coSignedAt) return res.status(400).json({error:'Payment already co-signed'});
+  payment.coSignedAt=now(); payment.coSignedBy=req.user.userId; payment.status='CO_SIGNED';
+  res.json({success:true,decision});
+  setImmediate(async()=>{
+    try{
+      const data=await flowable('GET',`/runtime/tasks?processInstanceId=${payment.processInstanceId}&size=10`);
+      const task=(data.data||[]).find(t=>t.name==='Co-Signer Approval');
+      if(!task){console.error('Co-sign task not found for',req.params.paymentId);return;}
+      await flowable('POST',`/runtime/tasks/${task.id}`,{action:'complete',variables:[
+        {name:'coSignerDecision',value:decision,type:'string'},{name:'coSignerComment',value:comment||'',type:'string'},
+        {name:'coSignedAt',value:now(),type:'string'},{name:'coSignedBy',value:req.user.userId,type:'string'},
+      ]});
+      console.log(`Co-sign task ${task.id} completed: ${decision} for payment ${req.params.paymentId}`);
+    }catch(e){console.error('Co-sign background error:',e.message);}
+  });
 });
 
-app.post('/workflow/tasks/:taskId/complete', authenticate, async (req, res) => {
-  const { decision, staffComment } = req.body;
-  if (!decision) return res.status(400).json({ error: 'decision required' });
-  try {
-    // Complete the Flowable task — now fast since no HTTP service tasks
-    await flowable('POST', `/runtime/tasks/${req.params.taskId}`, {
-      action: 'complete',
-      variables: [
-        { name: 'decision',     value: decision,            type: 'string' },
-        { name: 'staffComment', value: staffComment || '',  type: 'string' },
-        { name: 'reviewedBy',   value: req.user.userId,     type: 'string' },
-        { name: 'reviewedAt',   value: now(),               type: 'string' },
-      ],
-    });
+// ── Workflow tasks ────────────────────────────────────────────────────────────
+app.get('/workflow/tasks',authenticate,async(req,res)=>{
+  try{
+    const[beneficiaryData,paymentData]=await Promise.all([
+      flowable('GET','/runtime/tasks?processDefinitionKey=beneficiaryRegistration&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=paymentApproval&size=50'),
+    ]);
+    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[])];
+    const tasks=await Promise.all(allTasks.map(async task=>{
+      try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{...task,variables:varMap}; }
+      catch{return{...task,variables:{}};}
+    }));
+    const allowedTasks=roleTaskMap[req.user.role]||null;
+    const filtered=allowedTasks?tasks.filter(t=>allowedTasks.includes(t.taskDefinitionKey)):tasks;
+    res.json({data:filtered,total:filtered.length});
+  }catch(e){console.error('Flowable tasks error:',e.message);res.status(502).json({error:'Flowable unavailable',detail:e.message});}
+});
 
-    // Get process variables to know what to notify
-    const taskInfo = await flowable('GET', `/history/historic-task-instances/${req.params.taskId}`);
-    const processId = taskInfo?.processInstanceId;
+app.get('/workflow/tasks/:taskId',authenticate,async(req,res)=>{
+  try{
+    const task=await flowable('GET',`/runtime/tasks/${req.params.taskId}`);
+    const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`);
+    const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value);
+    res.json({data:{...task,variables:varMap}});
+  }catch(e){res.status(502).json({error:'Flowable unavailable'});}
+});
 
-    if (processId) {
-      const vars = await flowable('GET', `/history/historic-variable-instances?processInstanceId=${processId}`);
-      const varMap = {};
-      (vars?.data || []).forEach(v => varMap[v.variable.name] = v.variable.value);
+app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
+  const{decision,staffComment}=req.body;
+  if(!decision) return res.status(400).json({error:'decision required'});
+  res.json({success:true,decision});
+  setImmediate(async()=>{
+    try{
+      const task=await flowable('GET',`/runtime/tasks/${req.params.taskId}`);
+      const taskKey=task.taskDefinitionKey;
+      const decisionVar=taskKey==='coSignerApproval'?'coSignerDecision':taskKey==='rmApproval'?'rmDecision':'decision';
+      const commentVar=taskKey==='rmApproval'?'rmComment':'staffComment';
+      await flowable('POST',`/runtime/tasks/${req.params.taskId}`,{action:'complete',variables:[
+        {name:decisionVar,value:decision,type:'string'},{name:commentVar,value:staffComment||'',type:'string'},
+        {name:'reviewedBy',value:req.user.userId,type:'string'},{name:'reviewedAt',value:now(),type:'string'},
+      ]});
+      console.log(`Task ${req.params.taskId} completed: ${decision} (${taskKey})`);
 
-      const customerId = varMap.customerId;
-      const beneficiaryName = varMap.beneficiaryName;
-      const iban = varMap.iban;
-      const notificationType = decision === 'APPROVE' ? 'BENEFICIARY_APPROVED' : 'BENEFICIARY_REJECTED_STAFF';
+      // Fetch historic variables
+      const histVars=await flowable('GET',`/history/historic-variable-instances?processInstanceId=${task.processInstanceId}`);
+      const varMap={};
+      (histVars?.data||[]).forEach(v=>{ const name=v.variable?.name??v.variableName, value=v.variable?.value??v.value; if(name) varMap[name]=value; });
 
-      // Update beneficiary status in memory
-      const list = Object.values(beneficiaries).flat();
-      const b = list.find(b => b.beneficiaryName === beneficiaryName && b.iban === iban);
-      if (b) {
-        b.status = decision === 'APPROVE' ? 'ACTIVE' : 'REJECTED';
-        b.resolvedAt = now();
-        if (staffComment) b.staffComment = staffComment;
-        broadcast({ eventType: 'BENEFICIARY_UPDATED', payload: b, occurredAt: now() });
+      const paymentId=varMap.paymentId, beneficiaryName=varMap.beneficiaryName, customerId=varMap.customerId;
+
+      // Beneficiary notification
+      if(beneficiaryName&&!paymentId){
+        const iban=varMap.iban||'';
+        const notificationType=decision==='APPROVE'?'BENEFICIARY_APPROVED':'BENEFICIARY_REJECTED_STAFF';
+        const list=Object.values(beneficiaries).flat(), b=list.find(b=>b.beneficiaryName===beneficiaryName&&b.iban===iban);
+        if(b){ b.status=decision==='APPROVE'?'ACTIVE':'REJECTED'; b.resolvedAt=now(); if(staffComment) b.staffComment=staffComment; broadcast({eventType:'BENEFICIARY_UPDATED',payload:b,occurredAt:now()}); }
+        const fcmToken=fcmTokens[customerId];
+        if(fcmToken){
+          const msgs={BENEFICIARY_APPROVED:{title:'✅ Beneficiary Approved',body:`${beneficiaryName} is now active.`},BENEFICIARY_REJECTED_STAFF:{title:'❌ Beneficiary Registration Declined',body:`${beneficiaryName} was declined.${staffComment?' Reason: '+staffComment:''}`}};
+          if(msgs[notificationType]) await sendPush(fcmToken,{...msgs[notificationType],data:{type:notificationType,beneficiaryName,iban,customerId}});
+        }
       }
 
-      // Send push notification
-      const fcmToken = fcmTokens[customerId];
-      if (fcmToken) {
-        const messages = {
-          BENEFICIARY_APPROVED:       { title: '✅ Beneficiary Approved',              body: `${beneficiaryName} is now active.` },
-          BENEFICIARY_REJECTED_STAFF: { title: '❌ Beneficiary Registration Declined', body: `${beneficiaryName} was declined.${staffComment ? ' Reason: ' + staffComment : ''}` },
-        };
-        const msg = messages[notificationType];
-        if (msg) await sendPush(fcmToken, { ...msg, data: { type: notificationType, beneficiaryName, iban, customerId } });
-      }
-      console.log(`Task ${req.params.taskId} completed: ${decision} for ${beneficiaryName}`);
-    }
-    res.json({ success: true, decision });
-  } catch (e) {
-    console.error('Complete task error:', e.message);
-    res.status(502).json({ error: 'Failed to complete task', detail: e.message });
+      // Payment notifications
+      if (taskKey === 'rmApproval' || taskKey === 'coSignerApproval') {
+        // Get businessKey from process instance (= paymentId)
+        const procData = await flowable('GET', `/history/historic-process-instances/${task.processInstanceId}`);
+        const paymentId = procData?.businessKey;
+        const payment = payments[paymentId];
+        const customerId = payment?.customerId;
+
+        if (payment && decision === 'APPROVE') {
+          // Execute payment
+          payment.status = 'EXECUTED';
+          payment.resolvedAt = now();
+          broadcast({ eventType: 'PAYMENT_UPDATED', payload: payment, occurredAt: now() });
+          const fcmToken = fcmTokens[customerId];
+          if (fcmToken) await sendPush(fcmToken, {
+            title: '✅ Payment Executed',
+            body: `Your payment of ${payment.currency} ${payment.amount.toLocaleString()} to ${payment.beneficiaryName} has been executed.`,
+            data: { type: 'PAYMENT_EXECUTED', paymentId, customerId, amount: String(payment.amount), currency: payment.currency, beneficiaryName: payment.beneficiaryName },
+          });
+          if (payment.coSignerId) {
+            const coSignerToken = fcmTokens[payment.coSignerId];
+            if (coSignerToken) await sendPush(coSignerToken, {
+              title: '✅ Payment Approved',
+              body: `The payment to ${payment.beneficiaryName} has been fully approved and executed.`,
+              data: { type: 'PAYMENT_EXECUTED', paymentId },
+            });
+          }
+        } else if (payment && decision === 'REJECT') {
+          payment.status = 'REJECTED';
+          payment.resolvedAt = now();
+          broadcast({ eventType: 'PAYMENT_UPDATED', payload: payment, occurredAt: now() });
+          const fcmToken = fcmTokens[customerId];
+          const rejectedBy = taskKey === 'rmApproval' ? 'your Relationship Manager' : 'co-signer';
+          if (fcmToken) await sendPush(fcmToken, {
+            title: '❌ Payment Declined',
+            body: `Your payment to ${payment.beneficiaryName} was declined by ${rejectedBy}.`,
+            data: { type: taskKey === 'rmApproval' ? 'PAYMENT_REJECTED_RM' : 'PAYMENT_REJECTED_COSIGNER', paymentId, customerId },
+          });
+        }
+      }    
+    } catch(e){console.error('Complete task background error:',e.message);}
+  });
+});
+
+// ── Internal webhooks ─────────────────────────────────────────────────────────
+app.post('/internal/notify',(req,res)=>{
+  res.json({success:true});
+  const{customerId,type,beneficiaryName,iban,staffComment}=req.body;
+  console.log(`Internal notify: ${type} for ${customerId}`);
+  const list=Object.values(beneficiaries).flat(), b=list.find(b=>b.beneficiaryName===beneficiaryName&&b.iban===iban);
+  if(b){ b.status=type==='BENEFICIARY_APPROVED'?'ACTIVE':'REJECTED'; b.resolvedAt=now(); if(staffComment) b.staffComment=staffComment; broadcast({eventType:'BENEFICIARY_UPDATED',payload:b,occurredAt:now()}); }
+  const fcmToken=fcmTokens[customerId];
+  if(fcmToken){
+    const msgs={BENEFICIARY_APPROVED:{title:'✅ Beneficiary Approved',body:`${beneficiaryName} is now active.`},BENEFICIARY_REJECTED_IBAN:{title:'❌ Beneficiary Registration Failed',body:`Invalid IBAN for ${beneficiaryName}.`},BENEFICIARY_REJECTED_SANCTIONS:{title:'❌ Beneficiary Registration Failed',body:`${beneficiaryName} could not be approved.`},BENEFICIARY_REJECTED_STAFF:{title:'❌ Beneficiary Registration Declined',body:`${beneficiaryName} was declined.${staffComment?' Reason: '+staffComment:''}`}};
+    const msg=msgs[type]; if(msg) sendPush(fcmToken,{...msg,data:{type,beneficiaryName,iban,customerId}});
   }
 });
 
-// ── Internal webhook from Flowable ────────────────────────────────────────────
-app.post('/internal/notify', (req, res) => {
-  // Respond immediately so Flowable doesn't hang
-  res.json({ success: true });
-  
-  // Process asynchronously after response
-  const { customerId, type, beneficiaryName, iban, staffComment } = req.body;
-  console.log(`Notify: ${type} for ${customerId}`);
-  
-  // Update beneficiary status
-  const list = Object.values(beneficiaries).flat();
-  const b = list.find(b => b.beneficiaryName === beneficiaryName && b.iban === iban);
-  if (b) {
-    b.status = type === 'BENEFICIARY_APPROVED' ? 'ACTIVE' : 'REJECTED';
-    b.resolvedAt = now();
-    if (staffComment) b.staffComment = staffComment;
-    broadcast({ eventType: 'BENEFICIARY_UPDATED', payload: b, occurredAt: now() });
+app.post('/internal/payment-notify',(req,res)=>{
+  res.json({success:true});
+  const{paymentId,customerId,coSignerId,type,amount,currency,beneficiaryName}=req.body;
+  console.log(`Payment notify: ${type} for ${paymentId}`);
+  const payment=payments[paymentId];
+  if(payment){ payment.status=type==='PAYMENT_EXECUTED'?'EXECUTED':'REJECTED'; payment.resolvedAt=now(); broadcast({eventType:'PAYMENT_UPDATED',payload:payment,occurredAt:now()}); }
+  const amountFmt=`${currency} ${parseFloat(amount||0).toLocaleString('en-US',{minimumFractionDigits:2})}`;
+  const customerToken=fcmTokens[customerId];
+  if(customerToken){
+    const msgs={PAYMENT_EXECUTED:{title:'✅ Payment Executed',body:`${amountFmt} to ${beneficiaryName} has been executed.`},PAYMENT_REJECTED_COSIGNER:{title:'❌ Payment Declined',body:`Your payment of ${amountFmt} to ${beneficiaryName} was declined by co-signer.`},PAYMENT_REJECTED_RM:{title:'❌ Payment Declined',body:`Your payment of ${amountFmt} to ${beneficiaryName} was declined by RM.`}};
+    const msg=msgs[type]; if(msg) sendPush(customerToken,{...msg,data:{type,paymentId,amount:String(amount||0),currency,beneficiaryName}});
   }
-
-  // Send push notification asynchronously
-  const fcmToken = fcmTokens[customerId];
-  if (fcmToken) {
-    const messages = {
-      BENEFICIARY_APPROVED:           { title: '✅ Beneficiary Approved',              body: `${beneficiaryName} (${iban}) is now active.` },
-      BENEFICIARY_REJECTED_IBAN:      { title: '❌ Beneficiary Registration Failed',   body: `Invalid IBAN for ${beneficiaryName}.` },
-      BENEFICIARY_REJECTED_SANCTIONS: { title: '❌ Beneficiary Registration Failed',   body: `${beneficiaryName} could not be approved.` },
-      BENEFICIARY_REJECTED_STAFF:     { title: '❌ Beneficiary Registration Declined', body: `${beneficiaryName} was declined.${staffComment ? ' Reason: ' + staffComment : ''}` },
-    };
-    const msg = messages[type];
-    if (msg) sendPush(fcmToken, { ...msg, data: { type, beneficiaryName, iban, customerId } });
-  }
+  if(coSignerId&&type==='PAYMENT_EXECUTED'){ const tok=fcmTokens[coSignerId]; if(tok) sendPush(tok,{title:'✅ Payment Approved',body:`Your approval of ${amountFmt} to ${beneficiaryName} was processed.`,data:{type,paymentId}}); }
 });
 
-app.post('/internal/validate-iban', (req, res) => {
-  const clean = (req.body.iban || '').replace(/\s/g, '').toUpperCase();
-  const valid = /^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$/.test(clean);
-  res.json({ valid, iban: clean });
+app.post('/internal/pdf-notify',(req,res)=>{
+  res.json({success:true});
+  const{instanceId,type,title,initiatorId,nextRole}=req.body;
+  const roleToUser={rm:'u002',customer:'u002',compliance:'u005'};
+  const targetUserId=roleToUser[nextRole]||initiatorId, fcmToken=fcmTokens[targetUserId];
+  const msgs={PDF_INSTANCE_CREATED:{title:'📄 Document Created',body:`A new ${title} requires your input.`},PDF_ROLE_COMPLETED:{title:'📋 Document Ready for Review',body:`${title} is ready for your validation.`},PDF_INSTANCE_COMPLETED:{title:'✅ Document Completed',body:`${title} has been fully validated.`}};
+  if(fcmToken&&msgs[type]) sendPush(fcmToken,{...msgs[type],data:{type,instanceId,title:title||''}});
+  if(type==='PDF_INSTANCE_COMPLETED'&&initiatorId){ const tok=fcmTokens[initiatorId]; if(tok) sendPush(tok,{title:'✅ Document Completed',body:`${title} has been fully processed.`,data:{type,instanceId}}); }
 });
 
-// ── Workflow tasks (legacy) ───────────────────────────────────────────────────
-app.get('/workflow/tasks-legacy', (req, res) => res.json(response([])));
-app.post('/workflow/tasks/:taskId/approve', (req, res) => res.json(response({ taskId: req.params.taskId, status: 'APPROVED' })));
-app.post('/workflow/tasks/:taskId/reject',  (req, res) => res.json(response({ taskId: req.params.taskId, status: 'REJECTED' })));
+app.post('/internal/validate-iban',(req,res)=>{
+  const clean=(req.body.iban||'').replace(/\s/g,'').toUpperCase();
+  res.json({valid:/^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$/.test(clean),iban:clean});
+});
 
-// ── Signatures ────────────────────────────────────────────────────────────────
-app.post('/signatures/requests', (req, res) => res.status(201).json(response({ signatureRequestId: 'SIG-' + Date.now(), status: 'SENT' })));
-app.get('/signatures/requests/:id', (req, res) => res.json(response({ signatureRequestId: req.params.id, status: 'SIGNED', signedAt: now() })));
-
-// ── Static files ──────────────────────────────────────────────────────────────
-app.use('/static', express.static(path.join(__dirname, '..', 'client-web')));
-app.use('/login', express.static(path.join(__dirname, 'public')));
-
-// ── Cleanup ───────────────────────────────────────────────────────────────────
-setInterval(() => {
-  const n = Date.now();
-  for (const [id, c] of Object.entries(authChallenges)) {
-    if (n > c.expiresAt + 60000) delete authChallenges[id];
-  }
-}, 60000);
+setInterval(()=>{ const n=Date.now(); for(const[id,c] of Object.entries(authChallenges)) if(n>c.expiresAt+60000) delete authChallenges[id]; },60000);
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/events' });
-
-wss.on('connection', (ws) => {
+const server=http.createServer(app);
+const wss=new WebSocketServer({server,path:'/events'});
+wss.on('connection',ws=>{
   connectedClients.add(ws);
-  ws.send(JSON.stringify({ eventType: 'CONNECTED', timestamp: now(), payload: { dashboard: getAggregatedDashboard() } }));
-  ws.on('close', () => connectedClients.delete(ws));
-  ws.on('error', () => connectedClients.delete(ws));
+  ws.send(JSON.stringify({eventType:'CONNECTED',timestamp:now(),payload:{dashboard:getAggregatedDashboard()}}));
+  ws.on('close',()=>connectedClients.delete(ws));
+  ws.on('error',()=>connectedClients.delete(ws));
 });
 
-server.listen(port, () => {
+server.listen(port,()=>{
   console.log(`\n🏦 Private Banking Pi Server v${SERVER_VERSION}`);
   console.log(`   REST → http://localhost:${port}`);
   console.log(`   WS   → ws://localhost:${port}/events`);
-  console.log(`   Firebase: ${firebaseInitialized ? 'READY' : 'NOT CONFIGURED'}`);
+  console.log(`   Firebase: ${firebaseInitialized?'READY':'NOT CONFIGURED'}`);
   console.log(`   Flowable: ${FLOWABLE_URL}\n`);
 });
