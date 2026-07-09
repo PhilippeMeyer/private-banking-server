@@ -13,7 +13,7 @@ app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DE
 app.use(express.json());
 app.use(morgan('dev'));
 
-const SERVER_VERSION = '3.2.0';
+const SERVER_VERSION = '3.4.0';
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
 let firebaseInitialized = false;
@@ -473,6 +473,240 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
   });
 });
 
+
+// ── AI Banking Assistant (Azure OpenAI + MCP tools) ──────────────────────────
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https://hmzpoliciesevaluation.openai.azure.com/';
+const AZURE_OPENAI_KEY      = process.env.AZURE_OPENAI_KEY || '';
+const AZURE_DEPLOYMENT      = process.env.AZURE_DEPLOYMENT || 'gpt-4o';
+const AZURE_API_VERSION     = '2024-02-01';
+
+// MCP Tool definitions
+const bankingTools = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_portfolio_summary',
+      description: 'Get aggregated portfolio summary for the client including total AUM, day change, and asset allocation',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_portfolio_detail',
+      description: 'Get detailed information for a specific portfolio including positions and performance',
+      parameters: {
+        type: 'object',
+        properties: {
+          portfolio_id: { type: 'string', description: 'Portfolio ID e.g. P-1001, P-1002, P-1003' },
+        },
+        required: ['portfolio_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_positions',
+      description: 'Get current holdings and positions for a portfolio with live prices',
+      parameters: {
+        type: 'object',
+        properties: {
+          portfolio_id: { type: 'string', description: 'Portfolio ID' },
+        },
+        required: ['portfolio_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_transactions',
+      description: 'Get recent transaction history for the client',
+      parameters: {
+        type: 'object',
+        properties: {
+          portfolio_id: { type: 'string', description: 'Optional portfolio ID to filter transactions' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_beneficiaries',
+      description: 'Get list of registered beneficiaries and their approval status',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_payments',
+      description: 'Get payment history and status for the client',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_market_overview',
+      description: 'Get current market indices and overview',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_client_profile',
+      description: 'Get client profile information including name, portfolios and relationship manager',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+];
+
+// Execute MCP tool call
+async function executeTool(toolName, args, userId) {
+  switch (toolName) {
+    case 'get_portfolio_summary': {
+      const dashboard = getAggregatedDashboard();
+      return {
+        totalAum: dashboard.totalAum,
+        dayChange: dashboard.totalDayChange,
+        dayChangePct: dashboard.totalDayChangePct,
+        portfolios: dashboard.portfolioAllocation,
+        assetAllocation: dashboard.assetAllocation,
+      };
+    }
+    case 'get_portfolio_detail': {
+      const p = getLivePortfolio(args.portfolio_id);
+      if (!p) return { error: `Portfolio ${args.portfolio_id} not found` };
+      return p;
+    }
+    case 'get_positions': {
+      const positions = getLivePositions(args.portfolio_id);
+      const portfolio = getLivePortfolio(args.portfolio_id);
+      if (!portfolio) return { error: `Portfolio ${args.portfolio_id} not found` };
+      return { portfolioId: args.portfolio_id, positions, totalValue: portfolio.value };
+    }
+    case 'get_transactions': {
+      const txns = args.portfolio_id
+        ? transactions.filter(t => t.portfolioId === args.portfolio_id)
+        : transactions;
+      return { transactions: txns };
+    }
+    case 'get_beneficiaries': {
+      return { beneficiaries: beneficiaries[userId] || [] };
+    }
+    case 'get_payments': {
+      const userPayments = Object.values(payments).filter(
+        p => p.customerId === userId || p.coSignerId === userId
+      );
+      return { payments: userPayments };
+    }
+    case 'get_market_overview': {
+      return { markets: getMarketOverview() };
+    }
+    case 'get_client_profile': {
+      const user = users.find(u => u.id === userId);
+      const config = clientConfig[userId];
+      const rm = config ? users.find(u => u.id === 'u002') : null;
+      return {
+        id: user?.id, name: user?.name, role: user?.role,
+        portfolios: user?.portfolios || [],
+        relationshipManager: rm ? { id: rm.id, name: rm.name } : null,
+        coSignerName: config?.coSignerName || null,
+      };
+    }
+    default:
+      return { error: `Unknown tool: ${toolName}` };
+  }
+}
+
+// System prompt for the AI banking assistant
+const SYSTEM_PROMPT = `You are a professional private banking assistant for PrivateBank.
+You have access to real-time data about the client's portfolios, positions, payments and beneficiaries.
+Always use the available tools to fetch current data before answering questions about finances.
+Be concise, professional and precise. Format numbers with proper currency symbols and thousands separators.
+When showing portfolio values, always mention the day change.
+Never give generic financial advice — only discuss the client's actual data.
+Respond in the same language as the client's message.`;
+
+app.post('/api/v1/ai/chat', authenticate, async (req, res) => {
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
+  if (!AZURE_OPENAI_KEY) {
+    return res.status(503).json({ error: 'AI service not configured — set AZURE_OPENAI_KEY' });
+  }
+
+  try {
+    const chatMessages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...messages,
+    ];
+
+    let response;
+    let iterations = 0;
+    const maxIterations = 5;
+
+    while (iterations < maxIterations) {
+      iterations++;
+      const azureRes = await fetch(
+        `${AZURE_OPENAI_ENDPOINT}openai/deployments/${AZURE_DEPLOYMENT}/chat/completions?api-version=${AZURE_API_VERSION}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'api-key': AZURE_OPENAI_KEY,
+          },
+          body: JSON.stringify({
+            messages: chatMessages,
+            tools: bankingTools,
+            tool_choice: 'auto',
+            max_tokens: 1000,
+            temperature: 0.3,
+          }),
+        }
+      );
+
+      if (!azureRes.ok) {
+        const errText = await azureRes.text();
+        throw new Error(`Azure OpenAI error ${azureRes.status}: ${errText}`);
+      }
+
+      response = await azureRes.json();
+      const choice = response.choices?.[0];
+      const msg = choice?.message;
+
+      // No tool calls — final response
+      if (!msg?.tool_calls || msg.tool_calls.length === 0) break;
+
+      // Execute tool calls
+      chatMessages.push(msg);
+      for (const toolCall of msg.tool_calls) {
+        const toolName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments || '{}');
+        console.log(`AI tool call: ${toolName}`, args);
+        const result = await executeTool(toolName, args, req.user.userId);
+        chatMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result),
+        });
+      }
+    }
+
+    const finalMsg = response?.choices?.[0]?.message;
+    res.json({ data: { message: finalMsg?.content || 'No response', role: 'assistant' } });
+  } catch (e) {
+    console.error('AI chat error:', e.message);
+    res.status(502).json({ error: 'AI service unavailable', detail: e.message });
+  }
+});
+
 // ── Internal webhooks ─────────────────────────────────────────────────────────
 app.post('/internal/notify',(req,res)=>{
   res.json({success:true});
@@ -517,6 +751,125 @@ app.post('/internal/validate-iban',(req,res)=>{
   res.json({valid:/^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$/.test(clean),iban:clean});
 });
 
+
+
+// ── Process definition steps ──────────────────────────────────────────────────
+// Returns ordered user tasks from the BPMN process definition
+app.get('/workflow/process-definition/:key/steps', authenticate, async (req, res) => {
+  try {
+    // Get latest process definition
+    const defData = await flowable('GET',
+      `/repository/process-definitions?key=${req.params.key}&sort=version&order=desc&size=1`);
+    const def = (defData?.data || [])[0];
+    if (!def) return res.status(404).json({ error: 'Process definition not found' });
+
+    // Get model (BPMN XML)
+    const modelData = await flowable('GET',
+      `/repository/process-definitions/${def.id}/model`);
+
+    // Parse user tasks from the model JSON
+    // Flowable returns a JSON representation of the BPMN
+    const steps = [];
+
+    function extractTasks(element) {
+      if (!element) return;
+      // User tasks
+      if (element.type === 'StartNoneEvent' || element.resourceType === 'StartNoneEvent') {
+        steps.push({ key: 'start', name: 'Start', type: 'startEvent', assignee: null, candidateGroups: [] });
+      }
+      if (element.resourceType === 'UserTask' || element.type === 'UserTask') {
+        steps.push({
+          key: element.id || element.resourceId,
+          name: element.name || element.id,
+          type: 'userTask',
+          assignee: element.assignee || null,
+          candidateGroups: element.candidateGroups || [],
+        });
+      }
+      // Recurse into child elements
+      if (element.childShapes) element.childShapes.forEach(extractTasks);
+    }
+
+    if (modelData) extractTasks(modelData);
+
+    // If model parsing didn't work, fall back to historic activity instances
+    // from completed process instances of this definition
+    if (steps.filter(s => s.type === 'userTask').length === 0) {
+      const histProc = await flowable('GET',
+        `/history/historic-process-instances?processDefinitionKey=${req.params.key}&finished=true&size=1`);
+      const sample = (histProc?.data || [])[0];
+      if (sample) {
+        const activities = await flowable('GET',
+          `/history/historic-activity-instances?processInstanceId=${sample.id}&activityType=userTask&size=50`);
+        const seen = new Set();
+        (activities?.data || [])
+          .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
+          .forEach(a => {
+            if (!seen.has(a.activityId)) {
+              seen.add(a.activityId);
+              steps.push({
+                key: a.activityId,
+                name: a.activityName || a.activityId,
+                type: 'userTask',
+                assignee: a.assignee || null,
+                candidateGroups: [],
+              });
+            }
+          });
+      }
+    }
+
+    res.json({
+      data: {
+        processKey: req.params.key,
+        processName: def.name,
+        version: def.version,
+        steps: steps.filter(s => s.type === 'userTask'),
+      }
+    });
+  } catch (e) {
+    console.error('Process definition steps error:', e.message);
+    res.status(502).json({ error: 'Flowable unavailable', detail: e.message });
+  }
+});
+
+// ── Process activity history ───────────────────────────────────────────────────
+// Returns all activities for a process instance (for visualizer)
+app.get('/workflow/process/:processInstanceId/activities', authenticate, async (req, res) => {
+  try {
+    const [activities, currentTasks] = await Promise.all([
+      flowable('GET',
+        `/history/historic-activity-instances?processInstanceId=${req.params.processInstanceId}&activityType=userTask&size=50`),
+      flowable('GET',
+        `/runtime/tasks?processInstanceId=${req.params.processInstanceId}&size=10`),
+    ]);
+
+    const completed = (activities?.data || [])
+      .filter(a => a.endTime)
+      .map(a => ({
+        key:         a.activityId,
+        name:        a.activityName,
+        status:      'COMPLETED',
+        startTime:   a.startTime,
+        endTime:     a.endTime,
+        assignee:    a.assignee,
+        durationMs:  a.durationInMillis,
+      }));
+
+    const active = (currentTasks?.data || []).map(t => ({
+      key:       t.taskDefinitionKey,
+      name:      t.name,
+      status:    'ACTIVE',
+      startTime: t.createTime,
+      endTime:   null,
+      assignee:  t.assignee || null,
+    }));
+
+    res.json({ data: { completed, active } });
+  } catch (e) {
+    res.status(502).json({ error: 'Flowable unavailable' });
+  }
+});
 
 // ── Process status endpoint ───────────────────────────────────────────────────
 app.get('/workflow/process/:processInstanceId/status', authenticate, async (req, res) => {
