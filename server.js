@@ -13,7 +13,7 @@ app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DE
 app.use(express.json());
 app.use(morgan('dev'));
 
-const SERVER_VERSION = '3.1.0';
+const SERVER_VERSION = '3.2.0';
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
 let firebaseInitialized = false;
@@ -81,7 +81,7 @@ const clientConfig = {
 
 const roleTaskMap = {
   'COMPLIANCE_OFFICER':   ['staffReview', 'complianceValidation'],
-  'RELATIONSHIP_MANAGER': ['rmApproval', 'customerCallback'],
+  'RELATIONSHIP_MANAGER': ['rmApproval', 'customerCallback', 'rmInput'],
   'ADMIN': null,
 };
 
@@ -388,11 +388,12 @@ app.post('/payments/:paymentId/cosign',authenticate,async(req,res)=>{
 // ── Workflow tasks ────────────────────────────────────────────────────────────
 app.get('/workflow/tasks',authenticate,async(req,res)=>{
   try{
-    const[beneficiaryData,paymentData]=await Promise.all([
+    const[beneficiaryData,paymentData,documentData]=await Promise.all([
       flowable('GET','/runtime/tasks?processDefinitionKey=beneficiaryRegistration&size=50'),
       flowable('GET','/runtime/tasks?processDefinitionKey=paymentApproval&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=paymentDocumentApproval&size=50'),
     ]);
-    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[])];
+    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[]),...(documentData.data||[])];
     const tasks=await Promise.all(allTasks.map(async task=>{
       try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{...task,variables:varMap}; }
       catch{return{...task,variables:{}};}
@@ -449,46 +450,26 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
       }
 
       // Payment notifications
-      if (taskKey === 'rmApproval' || taskKey === 'coSignerApproval') {
-        // Get businessKey from process instance (= paymentId)
-        const procData = await flowable('GET', `/history/historic-process-instances/${task.processInstanceId}`);
-        const paymentId = procData?.businessKey;
-        const payment = payments[paymentId];
-        const customerId = payment?.customerId;
-
-        if (payment && decision === 'APPROVE') {
-          // Execute payment
-          payment.status = 'EXECUTED';
-          payment.resolvedAt = now();
-          broadcast({ eventType: 'PAYMENT_UPDATED', payload: payment, occurredAt: now() });
-          const fcmToken = fcmTokens[customerId];
-          if (fcmToken) await sendPush(fcmToken, {
-            title: '✅ Payment Executed',
-            body: `Your payment of ${payment.currency} ${payment.amount.toLocaleString()} to ${payment.beneficiaryName} has been executed.`,
-            data: { type: 'PAYMENT_EXECUTED', paymentId, customerId, amount: String(payment.amount), currency: payment.currency, beneficiaryName: payment.beneficiaryName },
-          });
-          if (payment.coSignerId) {
-            const coSignerToken = fcmTokens[payment.coSignerId];
-            if (coSignerToken) await sendPush(coSignerToken, {
-              title: '✅ Payment Approved',
-              body: `The payment to ${payment.beneficiaryName} has been fully approved and executed.`,
-              data: { type: 'PAYMENT_EXECUTED', paymentId },
-            });
+      if(paymentId){
+        const payment=payments[paymentId];
+        if(decision==='REJECT'){
+          // Rejected by RM or co-signer
+          if(payment) { payment.status='REJECTED'; payment.resolvedAt=now(); broadcast({eventType:'PAYMENT_UPDATED',payload:payment,occurredAt:now()}); }
+          const fcmToken=fcmTokens[customerId];
+          const rejectedBy=taskKey==='rmApproval'?'your Relationship Manager':'co-signer';
+          if(fcmToken&&payment) await sendPush(fcmToken,{title:'❌ Payment Declined',body:`Your payment to ${payment.beneficiaryName} was declined by ${rejectedBy}.${staffComment?' Reason: '+staffComment:''}`,data:{type:taskKey==='rmApproval'?'PAYMENT_REJECTED_RM':'PAYMENT_REJECTED_COSIGNER',paymentId,customerId}});
+        } else if(decision==='APPROVE'&&(taskKey==='rmApproval'||(taskKey==='coSignerApproval'&&payment?.approvalPath==='CO_SIGNER'))){
+          // Approved — execute payment
+          if(payment) { payment.status='EXECUTED'; payment.resolvedAt=now(); broadcast({eventType:'PAYMENT_UPDATED',payload:payment,occurredAt:now()}); }
+          const fcmToken=fcmTokens[customerId];
+          if(fcmToken&&payment) await sendPush(fcmToken,{title:'✅ Payment Executed',body:`Your payment of ${payment.currency} ${payment.amount.toLocaleString()} to ${payment.beneficiaryName} has been executed.`,data:{type:'PAYMENT_EXECUTED',paymentId,customerId,amount:String(payment.amount),currency:payment.currency,beneficiaryName:payment.beneficiaryName}});
+          if(payment?.coSignerId){
+            const coSignerToken=fcmTokens[payment.coSignerId];
+            if(coSignerToken) await sendPush(coSignerToken,{title:'✅ Payment Approved',body:`The payment to ${payment.beneficiaryName} has been fully approved and executed.`,data:{type:'PAYMENT_EXECUTED',paymentId}});
           }
-        } else if (payment && decision === 'REJECT') {
-          payment.status = 'REJECTED';
-          payment.resolvedAt = now();
-          broadcast({ eventType: 'PAYMENT_UPDATED', payload: payment, occurredAt: now() });
-          const fcmToken = fcmTokens[customerId];
-          const rejectedBy = taskKey === 'rmApproval' ? 'your Relationship Manager' : 'co-signer';
-          if (fcmToken) await sendPush(fcmToken, {
-            title: '❌ Payment Declined',
-            body: `Your payment to ${payment.beneficiaryName} was declined by ${rejectedBy}.`,
-            data: { type: taskKey === 'rmApproval' ? 'PAYMENT_REJECTED_RM' : 'PAYMENT_REJECTED_COSIGNER', paymentId, customerId },
-          });
         }
-      }    
-    } catch(e){console.error('Complete task background error:',e.message);}
+      }
+    }catch(e){console.error('Complete task background error:',e.message);}
   });
 });
 
@@ -534,6 +515,56 @@ app.post('/internal/pdf-notify',(req,res)=>{
 app.post('/internal/validate-iban',(req,res)=>{
   const clean=(req.body.iban||'').replace(/\s/g,'').toUpperCase();
   res.json({valid:/^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$/.test(clean),iban:clean});
+});
+
+
+// ── Process status endpoint ───────────────────────────────────────────────────
+app.get('/workflow/process/:processInstanceId/status', authenticate, async (req, res) => {
+  try {
+    const [procData, taskData, histVars] = await Promise.all([
+      flowable('GET', `/history/historic-process-instances/${req.params.processInstanceId}`),
+      flowable('GET', `/runtime/tasks?processInstanceId=${req.params.processInstanceId}&size=10`),
+      flowable('GET', `/history/historic-variable-instances?processInstanceId=${req.params.processInstanceId}`),
+    ]);
+
+    // Build variable map
+    const varMap = {};
+    (histVars?.data || []).forEach(v => {
+      const name = v.variable?.name ?? v.variableName;
+      const value = v.variable?.value ?? v.value;
+      if (name) varMap[name] = value;
+    });
+
+    // Get completed tasks from history
+    const histTasks = await flowable('GET',
+      `/history/historic-task-instances?processInstanceId=${req.params.processInstanceId}&size=50`);
+    const history = (histTasks?.data || [])
+      .filter(t => t.endTime)
+      .map(t => ({
+        taskKey: t.taskDefinitionKey,
+        name: t.name,
+        completedAt: t.endTime,
+        completedBy: t.assignee || null,
+        durationMs: t.durationInMillis,
+      }));
+
+    const currentTask = (taskData?.data || [])[0];
+
+    res.json({
+      data: {
+        processInstanceId: req.params.processInstanceId,
+        ended: procData?.ended ?? false,
+        endTime: procData?.endTime ?? null,
+        currentTask: currentTask?.taskDefinitionKey ?? null,
+        currentTaskName: currentTask?.name ?? null,
+        variables: varMap,
+        history,
+      }
+    });
+  } catch (e) {
+    console.error('Process status error:', e.message);
+    res.status(502).json({ error: 'Flowable unavailable', detail: e.message });
+  }
 });
 
 setInterval(()=>{ const n=Date.now(); for(const[id,c] of Object.entries(authChallenges)) if(n>c.expiresAt+60000) delete authChallenges[id]; },60000);
