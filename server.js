@@ -82,6 +82,7 @@ const clientConfig = {
 const roleTaskMap = {
   'COMPLIANCE_OFFICER':   ['staffReview', 'complianceValidation'],
   'RELATIONSHIP_MANAGER': ['rmApproval', 'customerCallback', 'rmInput'],
+  'CREDIT_OFFICER':    ['creditApproval'],
   'ADMIN': null,
 };
 
@@ -390,12 +391,13 @@ app.post('/payments/:paymentId/cosign',authenticate,async(req,res)=>{
 // ── Workflow tasks ────────────────────────────────────────────────────────────
 app.get('/workflow/tasks',authenticate,async(req,res)=>{
   try{
-    const[beneficiaryData,paymentData,documentData]=await Promise.all([
+    const[beneficiaryData,paymentData,documentData,lombardData]=await Promise.all([
       flowable('GET','/runtime/tasks?processDefinitionKey=beneficiaryRegistration&size=50'),
       flowable('GET','/runtime/tasks?processDefinitionKey=paymentApproval&size=50'),
       flowable('GET','/runtime/tasks?processDefinitionKey=paymentDocumentApproval&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=lombardCredit&size=50'),
     ]);
-    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[]),...(documentData.data||[])];
+    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[]),...(documentData.data||[]),...(lombardData.data||[])];
     const tasks=await Promise.all(allTasks.map(async task=>{
       try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{...task,variables:varMap}; }
       catch{return{...task,variables:{}};}
@@ -468,6 +470,30 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
           if(payment?.coSignerId){
             const coSignerToken=fcmTokens[payment.coSignerId];
             if(coSignerToken) await sendPush(coSignerToken,{title:'✅ Payment Approved',body:`The payment to ${payment.beneficiaryName} has been fully approved and executed.`,data:{type:'PAYMENT_EXECUTED',paymentId}});
+          }
+        }
+      }
+
+      // Lombard credit approval
+      if(taskKey==='creditApproval'){
+        const creditId=varMap.creditId;
+        const credit=lombardCredits[creditId];
+        if(credit){
+          if(decision==='APPROVE'){
+            credit.status='APPROVED';
+            credit.approvedAmount=parseFloat(varMap.approvedAmount||credit.requestedAmount);
+            credit.approvedAt=now();
+            credit.approvedBy=req.user.userId;
+            recalcLombard(credit);
+            broadcast({eventType:'LOMBARD_UPDATED',payload:credit,occurredAt:now()});
+            const tok=fcmTokens[credit.customerId];
+            if(tok) sendPush(tok,{title:'Lombard Credit Approved',body:'Your credit line has been approved.',data:{type:'LOMBARD_APPROVED',creditId}});
+          } else {
+            credit.status='REJECTED';
+            credit.rejectedAt=now();
+            credit.rejectedBy=req.user.userId;
+            const tok=fcmTokens[credit.customerId];
+            if(tok) sendPush(tok,{title:'Lombard Credit Declined',body:'Your Lombard credit request has been declined.',data:{type:'LOMBARD_REJECTED',creditId}});
           }
         }
       }
