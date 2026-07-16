@@ -11,6 +11,30 @@ const app = express();
 const port = process.env.PORT || 3001;
 app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json());
+
+// ── Price Server ──────────────────────────────────────────────────────────────
+const PRICE_SERVER_URL = process.env.PRICE_SERVER_URL || 'http://localhost:3002';
+
+async function fetchPrices() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/prices`);
+    if (!res.ok) throw new Error(`Price server ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error('Price server fetch error:', e.message);
+    return null;
+  }
+}
+
+async function fetchMarketOverview() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/market-overview`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    return data.data || {};
+  } catch { return {}; }
+}
+
 app.use(morgan('dev'));
 
 const SERVER_VERSION = '3.6.0';
@@ -141,11 +165,7 @@ const transactions = [
   { id:'TX-5',portfolioId:'P-1003',tradeDate:'2025-05-19',settlementDate:'2025-05-23',type:'BUY',     instrument:'Swiss Conf.', instrumentId:'BOND-1',quantity:2000,price:98.23, currency:'CHF',amountChf:-196460,   account:'Preservation 11223344',status:'SETTLED'},
 ];
 
-function gbmTick(price, vol) {
-  const dt = 3/(252*8*3600);
-  const z = Math.sqrt(-2*Math.log(Math.random()))*Math.cos(2*Math.PI*Math.random());
-  return price*Math.exp(-0.5*vol*vol*dt+vol*Math.sqrt(dt)*z);
-}
+// GBM simulation moved to price-server
 
 function getLivePositions(portfolioId) {
   return positionBase.filter(p=>p.portfolioId===portfolioId).map(p=>{
@@ -190,15 +210,34 @@ const authChallenges={}, beneficiaries={}, payments={}, connectedClients=new Set
 function broadcast(payload){ const msg=JSON.stringify(payload); for(const ws of connectedClients) if(ws.readyState===1) ws.send(msg); }
 
 // ── Simulation ────────────────────────────────────────────────────────────────
-setInterval(()=>{
+async function pollAndBroadcast(){
+  const data = await fetchPrices();
+  if(!data) return;
+  const priceData  = data.data  || {};
+  const fxData     = data.fx    || {};
+  const marketData = data.marketOverview || {};
+  // Update local fx
+  Object.assign(fx, fxData);
+  // Update instrument prices from price server
   const priceChanges=[];
-  for(const [id,inst] of Object.entries(instruments)){ const prev=inst.price; inst.price=gbmTick(inst.price,inst.vol); priceChanges.push({instrumentId:id,prev:+prev.toFixed(4),price:+inst.price.toFixed(4),currency:inst.currency}); }
-  for(const idx of Object.values(indices)) idx.value=gbmTick(idx.value,idx.vol);
+  for(const [id,inst] of Object.entries(instruments)){
+    const pd = priceData[id];
+    if(!pd) continue;
+    const prev = inst.price;
+    inst.price = pd.price;
+    priceChanges.push({instrumentId:id,prev:+prev.toFixed(4),price:+inst.price.toFixed(4),currency:inst.currency});
+  }
+  // Update indices from market overview
+  for(const [name,val] of Object.entries(marketData)){
+    if(indices[name]) indices[name].value = val.value;
+  }
   const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0);
   broadcast({eventId:'EVT-'+Date.now(),source:'MARKET_DATA',eventType:'PRICE_UPDATED',occurredAt:now(),payload:{prices:priceChanges,portfolios,totalAum:+totalAum.toFixed(2),marketOverview:getMarketOverview()}});
   // Recalculate lombard credits on each price tick
   if(Object.keys(lombardCredits).length>0) monitorLombardCredits();
-},3000);
+}
+setInterval(() => pollAndBroadcast().catch(e => console.error('poll error:', e.message)), 3000);
+pollAndBroadcast().catch(e => console.error('pollAndBroadcast error:', e.message)); // initial fetch
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
 app.post('/api/v1/auth/login',(req,res)=>{
@@ -498,6 +537,7 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
     }catch(e){console.error('Complete task background error:',e.message);}
   });
 });
+
 
 
 
