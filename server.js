@@ -82,7 +82,6 @@ const clientConfig = {
 const roleTaskMap = {
   'COMPLIANCE_OFFICER':   ['staffReview', 'complianceValidation'],
   'RELATIONSHIP_MANAGER': ['rmApproval', 'customerCallback', 'rmInput'],
-  'CREDIT_OFFICER':    ['creditApproval'],
   'ADMIN': null,
 };
 
@@ -473,7 +472,6 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
           }
         }
       }
-
       // Lombard credit approval
       if(taskKey==='creditApproval'){
         const creditId=varMap.creditId;
@@ -487,13 +485,13 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
             recalcLombard(credit);
             broadcast({eventType:'LOMBARD_UPDATED',payload:credit,occurredAt:now()});
             const tok=fcmTokens[credit.customerId];
-            if(tok) sendPush(tok,{title:'Lombard Credit Approved',body:'Your credit line has been approved.',data:{type:'LOMBARD_APPROVED',creditId}});
+            if(tok) await sendPush(tok,{title:'Lombard Credit Approved',body:'Your credit line of '+credit.currency+' '+credit.approvedAmount.toLocaleString()+' has been approved.',data:{type:'LOMBARD_APPROVED',creditId}});
           } else {
             credit.status='REJECTED';
             credit.rejectedAt=now();
             credit.rejectedBy=req.user.userId;
             const tok=fcmTokens[credit.customerId];
-            if(tok) sendPush(tok,{title:'Lombard Credit Declined',body:'Your Lombard credit request has been declined.',data:{type:'LOMBARD_REJECTED',creditId}});
+            if(tok) await sendPush(tok,{title:'Lombard Credit Declined',body:'Your Lombard credit request has been declined.',data:{type:'LOMBARD_REJECTED',creditId}});
           }
         }
       }
@@ -834,30 +832,18 @@ app.post('/lombard/credits/:id/drawdown', authenticate, async (req, res) => {
   }
 
   const drawdownId = 'DD-' + Date.now();
-  const needsRmApproval = amountChf > DRAWDOWN_RM_THRESHOLD;
-
+  // Auto-approve all drawdowns — credit line already approved by Credit Officer
   const drawdown = {
     id: drawdownId, amount: amountNum, currency: credit.currency,
-    amountChf, status: needsRmApproval ? 'PENDING_RM' : 'EXECUTED',
-    requestedAt: now(), executedAt: needsRmApproval ? null : now(),
+    amountChf, status: 'EXECUTED',
+    requestedAt: now(), executedAt: now(),
     comment: comment || '',
   };
   credit.drawdowns.push(drawdown);
-
-  if (!needsRmApproval) {
-    credit.drawnAmount += amountNum;
-    recalcLombard(credit);
-    broadcast({ eventType: 'LOMBARD_UPDATED', payload: credit, occurredAt: now() });
-    console.log(`Lombard drawdown ${drawdownId}: ${amountNum} ${credit.currency}`);
-  } else {
-    // Notify RM
-    const rmTok = fcmTokens['u002'];
-    if (rmTok) await sendPush(rmTok, {
-      title: '💳 Lombard Draw Down Approval',
-      body: `${credit.customerName} requests ${credit.currency} ${amountNum.toLocaleString()} draw down`,
-      data: { type: 'LOMBARD_DRAWDOWN_APPROVAL', creditId: credit.id, drawdownId },
-    });
-  }
+  credit.drawnAmount += amountNum;
+  recalcLombard(credit);
+  broadcast({ eventType: 'LOMBARD_UPDATED', payload: credit, occurredAt: now() });
+  console.log('Lombard drawdown ' + drawdownId + ': ' + amountNum + ' ' + credit.currency);
   res.json({ data: { credit: recalcLombard(credit), drawdown } });
 });
 
@@ -1006,6 +992,51 @@ app.patch('/card/settings', authenticate, (req, res) => {
 });
 
 
+// ── TradingView chart proxy ───────────────────────────────────────────────────
+app.get('/chart/:symbol', (req, res) => {
+  const raw    = decodeURIComponent(req.params.symbol);
+  const symbol = raw.replace(/-/g, ':').replace(/x$/,'!');
+  // Use TradingView's official embed iframe — no CORS issues
+  const tvUrl  = `https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=${encodeURIComponent(symbol)}&interval=D&timezone=Europe%2FZurich&theme=light&style=1&locale=en&toolbar_bg=%23ffffff&enable_publishing=0&hide_top_toolbar=0&allow_symbol_change=1&withdateranges=1&details=1&studies=RSI%40tv-basicstudies%2CMACD%40tv-basicstudies&hide_legend=0`;
+  res.redirect(302, tvUrl);
+});
+
+
+function getAggregatedDashboardForUser(userId) {
+  const user = users.find(u => u.id === userId);
+  if (!user?.portfolios?.length) return null;
+  let totalAum = 0, totalDayChange = 0;
+  for (const pid of user.portfolios) {
+    const p = getLivePortfolio(pid);
+    if (p) {
+      totalAum       += p.value ?? 0;
+      totalDayChange += p.dayChange ?? 0;
+    }
+  }
+  const totalDayChangePct = totalAum > 0
+    ? (totalDayChange / (totalAum - totalDayChange)) * 100 : 0;
+  return { totalAum, totalDayChange, totalDayChangePct };
+}
+
+
+// ── RM Client Overview ────────────────────────────────────────────────────────
+app.get('/rm/clients', authenticate, (req, res) => {
+  // Return all PRIVATE_CLIENT users with their live portfolio data
+  const clients = users
+    .filter(u => u.role === 'PRIVATE_CLIENT')
+    .map(u => {
+      const dashboard = getAggregatedDashboardForUser(u.id);
+      return {
+        id:           u.id,
+        name:         u.name,
+        portfolios:   u.portfolios || [],
+        totalAum:     dashboard?.totalAum ?? 0,
+        dayChange:    dashboard?.totalDayChange ?? 0,
+        dayChangePct: dashboard?.totalDayChangePct ?? 0,
+      };
+    });
+  res.json({ data: clients });
+});
 
 // ── AI Banking Assistant (Azure OpenAI + MCP tools) ──────────────────────────
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https://hmzpoliciesevaluation.openai.azure.com/';
