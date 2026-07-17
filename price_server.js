@@ -289,9 +289,8 @@ function getIndices() {
 }
 
 // ── Timers ────────────────────────────────────────────────────────────────────
-// Fetch real prices every 5 minutes
-fetchRealPrices();
-setInterval(fetchRealPrices, 30 * 60 * 1000);
+// Fetch real prices every 2 hours (no immediate startup fetch)
+setInterval(fetchRealPrices, 2 * 60 * 60 * 1000);
 
 // GBM tick every 3 seconds
 tick();
@@ -342,6 +341,6 @@ app.listen(PORT, () => {
   console.log(`💹 Price Server v${VERSION}`);
   console.log(`   REST → http://localhost:${PORT}`);
   console.log(`   Instruments: ${Object.keys(INSTRUMENTS).length} (${Object.values(INSTRUMENTS).filter(i=>i.yahooSymbol).length} Yahoo + ${Object.values(INSTRUMENTS).filter(i=>i.coinGeckoId).length} CoinGecko + ${Object.values(INSTRUMENTS).filter(i=>!i.yahooSymbol&&!i.coinGeckoId).length} simulated)`);
-  console.log(`   Real price fetch: every 30 minutes`);
+  console.log(`   Real price fetch: every 2 hours (~468 credits/day)`);
   console.log(`   GBM simulation: every 3s between fetches`);
 });
