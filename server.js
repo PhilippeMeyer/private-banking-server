@@ -11,30 +11,6 @@ const app = express();
 const port = process.env.PORT || 3001;
 app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json());
-
-// ── Price Server ──────────────────────────────────────────────────────────────
-const PRICE_SERVER_URL = process.env.PRICE_SERVER_URL || 'http://localhost:3002';
-
-async function fetchPrices() {
-  try {
-    const res = await fetch(`${PRICE_SERVER_URL}/prices`);
-    if (!res.ok) throw new Error(`Price server ${res.status}`);
-    return await res.json();
-  } catch (e) {
-    console.error('Price server fetch error:', e.message);
-    return null;
-  }
-}
-
-async function fetchMarketOverview() {
-  try {
-    const res = await fetch(`${PRICE_SERVER_URL}/market-overview`);
-    if (!res.ok) return {};
-    const data = await res.json();
-    return data.data || {};
-  } catch { return {}; }
-}
-
 app.use(morgan('dev'));
 
 const SERVER_VERSION = '3.6.0';
@@ -91,12 +67,12 @@ function authenticate(req, res, next) {
 
 // ── Users & config ────────────────────────────────────────────────────────────
 const users = [
-  { id: 'u001', username: 'client',     password: 'client123',  name: 'Philippe Meyer',      role: 'PRIVATE_CLIENT',       portfolios: ['P-1001','P-1002','P-1003'] },
+  { id: 'u001', username: 'client',     password: 'client123',  name: 'Philippe Meyer',      role: 'PRIVATE_CLIENT',       portfolios: ['P-1001','P-1002','P-1003'], avaloqPersonId: 1001 },
   { id: 'u002', username: 'rm',         password: 'rm123',      name: 'John Smith',           role: 'RELATIONSHIP_MANAGER' },
   { id: 'u003', username: 'credit',     password: 'credit123',  name: 'Sarah Wilson',         role: 'CREDIT_OFFICER' },
   { id: 'u004', username: 'admin',      password: 'admin123',   name: 'System Administrator', role: 'ADMIN' },
   { id: 'u005', username: 'compliance', password: 'comp123',    name: 'Marie Dubois',         role: 'COMPLIANCE_OFFICER' },
-  { id: 'u006', username: 'sophie',     password: 'sophie123',  name: 'Sophie Meyer',         role: 'PRIVATE_CLIENT',       portfolios: [], coSignerFor: ['u001'] },
+  { id: 'u006', username: 'sophie',     password: 'sophie123',  name: 'Sophie Meyer',         role: 'PRIVATE_CLIENT',       portfolios: [], coSignerFor: ['u001'], avaloqPersonId: 1002 },
 ];
 
 const clientConfig = {
@@ -168,6 +144,13 @@ const transactions = [
 // GBM simulation moved to price-server
 
 function getLivePositions(portfolioId) {
+  // Try Avaloq cache first, fall back to legacy hardcoded data
+  const containerId = getContainerIdForPortfolio(portfolioId);
+  if (containerId && avaloqCache.containers[containerId]) {
+    const cont = avaloqCache.containers[containerId];
+    return (cont.posList || []).map(pos => avaloqPosToPosition(pos, portfolioId));
+  }
+  // Legacy fallback (used if Avaloq cache not yet loaded)
   return positionBase.filter(p=>p.portfolioId===portfolioId).map(p=>{
     const inst=instruments[p.instrumentId], fxRate=fx[inst.currency]||1;
     const mv=p.quantity*inst.price*fxRate, cost=p.quantity*(costBasis[p.instrumentId]||inst.price)*fxRate;
@@ -176,18 +159,56 @@ function getLivePositions(portfolioId) {
 }
 
 function getLivePortfolio(portfolioId) {
-  const meta=portfolioMeta[portfolioId]; if(!meta)return null;
-  const positions=getLivePositions(portfolioId);
-  const investedValue=positions.reduce((s,p)=>s+p.marketValueChf,0);
-  const totalValue=investedValue+meta.cash, prevValue=totalValue*0.9801;
-  const byClass={};
-  for(const p of positions) byClass[p.assetClass]=(byClass[p.assetClass]||0)+p.marketValueChf;
-  byClass['Cash & Money Market']=(byClass['Cash & Money Market']||0)+meta.cash;
-  const allocation=Object.entries(byClass).map(([assetClass,valueChf])=>({assetClass,pct:+((valueChf/totalValue)*100).toFixed(1),valueChf:+valueChf.toFixed(0)}));
-  return { id:portfolioId,name:meta.name,mandate:meta.mandate,baseCurrency:meta.currency,color:meta.color,value:+totalValue.toFixed(2),dayChange:+(totalValue-prevValue).toFixed(2),dayChangePct:+((totalValue-prevValue)/prevValue*100).toFixed(2),allocation };
+  // Try Avaloq cache first
+  const containerId = getContainerIdForPortfolio(portfolioId);
+  const avqCont = containerId ? avaloqCache.containers[containerId] : null;
+  
+  // Get name and currency from Avaloq or fall back to meta
+  const name     = avqCont?.objNameList?.[0]?.name || portfolioMeta[portfolioId]?.name || portfolioId;
+  const currency = avqCont?.refCurry?.extn?.assetIso?.[0]?.val || portfolioMeta[portfolioId]?.currency || 'CHF';
+  const meta     = portfolioMeta[portfolioId];
+  const color    = meta?.color || '#1A56DB';
+  const mandate  = meta?.mandate || 'Balanced';
+
+  const positions = getLivePositions(portfolioId);
+  const investedValue = positions.filter(p => p.assetClass !== 'Cash & Money Market')
+    .reduce((s,p) => s + p.marketValueChf, 0);
+  const cashValue = positions.filter(p => p.assetClass === 'Cash & Money Market')
+    .reduce((s,p) => s + p.marketValueChf, 0);
+  const totalValue  = investedValue + cashValue;
+  const prevValue   = totalValue * 0.9801;
+
+  const byClass = {};
+  for (const p of positions) byClass[p.assetClass] = (byClass[p.assetClass] || 0) + p.marketValueChf;
+  const allocation = Object.entries(byClass).map(([assetClass, valueChf]) => ({
+    assetClass, pct: +((valueChf/totalValue)*100).toFixed(1), valueChf: +valueChf.toFixed(0)
+  }));
+
+  return {
+    id: portfolioId, name, mandate, baseCurrency: currency, color,
+    value: +totalValue.toFixed(2),
+    dayChange: +(totalValue - prevValue).toFixed(2),
+    dayChangePct: +((totalValue - prevValue)/prevValue*100).toFixed(2),
+    allocation,
+  };
 }
 
-function getAllPortfolios(){ return Object.keys(portfolioMeta).map(id=>getLivePortfolio(id)); }
+function getAllPortfolios(userId) {
+  // If Avaloq cache has containers, derive portfolio IDs from there
+  if (Object.keys(avaloqCache.containers).length > 0) {
+    // Get containers accessible to this user via their person ID
+    const user = userId ? users.find(u => u.id === userId) : null;
+    const personId = user?.avaloqPersonId || 1001; // default to Philippe
+    const bpIds = avaloqCache.personToBps[personId] || [];
+    // For now return all containers (system access) — filter by user later
+    const portfolioIds = Object.values(avaloqCache.containers)
+      .map(c => c.extn?.contNr?.[0]?.val)
+      .filter(Boolean);
+    return portfolioIds.map(id => getLivePortfolio(id)).filter(Boolean);
+  }
+  // Fallback to hardcoded portfolioMeta
+  return Object.keys(portfolioMeta).map(id=>getLivePortfolio(id));
+}
 function getMarketOverview(){ return Object.entries(indices).map(([name,idx])=>({name,value:+idx.value.toFixed(2),changePct:+(((idx.value/(idx.value/1.005))-1)*100).toFixed(2)})); }
 function getAggregatedDashboard(){
   const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0),totalDayChange=portfolios.reduce((s,p)=>s+p.dayChange,0);
@@ -210,6 +231,150 @@ const authChallenges={}, beneficiaries={}, payments={}, connectedClients=new Set
 function broadcast(payload){ const msg=JSON.stringify(payload); for(const ws of connectedClients) if(ws.readyState===1) ws.send(msg); }
 
 // ── Simulation ────────────────────────────────────────────────────────────────
+
+// ── Avaloq Mock Client ────────────────────────────────────────────────────────
+const AVALOQ_BASE_URL = process.env.AVALOQ_BASE_URL || 'http://localhost:3003/api1';
+
+// Server-to-server token: BFF has full access to Avaloq
+// In production: use OAuth2 client credentials flow
+function avaloqToken(personId = 'SYSTEM') {
+  return Buffer.from(JSON.stringify({ personId, role: 'SYSTEM' })).toString('base64');
+}
+
+async function avaloqGet(path, personId = 'SYSTEM') {
+  try {
+    const url = AVALOQ_BASE_URL + path;
+    const res  = await fetch(url, {
+      headers: {
+        'Authorization': 'Bearer ' + avaloqToken(personId),
+        'Accept': 'application/json',
+        'Accept-Language': 'en',
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error('Avaloq ' + res.status + ' ' + path);
+    return await res.json();
+  } catch(e) {
+    console.error('Avaloq client error:', e.message);
+    return null;
+  }
+}
+
+// ── Avaloq data cache ─────────────────────────────────────────────────────────
+// Populated at startup and refreshed every 5 minutes
+// BFF enriches this with live prices from the price server
+let avaloqCache = {
+  persons:    {},   // personId → person object
+  bps:        {},   // bpId → BP object  
+  containers: {},   // containerId → container (with posList)
+  personToBps: {},  // personId → [bpId]
+  bpToContainers: {}, // bpId → [containerId]
+  lastRefresh: null,
+};
+
+async function refreshAvaloqCache() {
+  console.log('Refreshing Avaloq cache...');
+  try {
+    // 1. Load all containers (positions) — using system token
+    const containers = await avaloqGet('/obj-conts%2Bgetaccounts?limit=200');
+    if (containers) {
+      avaloqCache.containers = {};
+      for (const c of containers) {
+        avaloqCache.containers[c.id] = c;
+      }
+    }
+
+    // 2. Load BPs with access rights (who owns/controls them)
+    const bps = await avaloqGet('/obj-bps%2Bavq_acc_owner_name?limit=200');
+    if (bps) {
+      avaloqCache.bps = {};
+      avaloqCache.personToBps = {};
+      for (const bp of bps) {
+        avaloqCache.bps[bp.id] = bp;
+        // Build person → BP mapping from bpPersonRelList
+        for (const rel of bp.bpPersonRelList || []) {
+          const pid = rel.trgObj?.id;
+          if (pid) {
+            if (!avaloqCache.personToBps[pid]) avaloqCache.personToBps[pid] = [];
+            if (!avaloqCache.personToBps[pid].includes(bp.id))
+              avaloqCache.personToBps[pid].push(bp.id);
+          }
+        }
+      }
+    }
+
+    // 3. Load persons
+    const persons = await avaloqGet('/obj-persons?limit=200');
+    if (persons) {
+      avaloqCache.persons = {};
+      for (const p of persons) avaloqCache.persons[p.id] = p;
+    }
+
+    // 4. Build BP → containers mapping from container._bpId
+    // (containers have _bpId but we sanitize it — use BP's containerIds from mock)
+    // Since mock uses numeric bpId in containers, we rebuild from BP list
+    avaloqCache.bpToContainers = {};
+    for (const c of Object.values(avaloqCache.containers)) {
+      // Each container's extn.contNr tells us the account number
+      // BFF links containers to BPs via the person access chain
+      // For now: all containers accessible to a person are linked to their BPs
+    }
+
+    avaloqCache.lastRefresh = new Date().toISOString();
+    console.log(`Avaloq cache: ${Object.keys(avaloqCache.containers).length} containers, ${Object.keys(avaloqCache.bps).length} BPs, ${Object.keys(avaloqCache.persons).length} persons`);
+  } catch(e) {
+    console.error('Avaloq cache refresh error:', e.message);
+  }
+}
+
+// ── Portfolio helpers using Avaloq data ───────────────────────────────────────
+// Maps Avaloq container position to BFF position format
+function avaloqPosToPosition(pos, containerId) {
+  const ticker   = pos.extn?.posSym?.[0]?.val || pos.asset?.extn?.assetTkn?.[0]?.val || 'UNKNOWN';
+  const isin     = pos.asset?.extn?.assetIsin?.[0]?.val || '';
+  const currency = pos.asset?.nomCurry?.extn?.assetIso?.[0]?.val || 'CHF';
+  const subType  = pos.objSubType?.intlId || 'SECURITY';
+  const assetClass = subType === 'CASH' ? 'Cash & Money Market'
+                   : subType === 'BOND' ? 'Fixed Income'
+                   : 'Equities';
+
+  // Enrich with live price from price server
+  const liveInst = instruments[ticker];
+  const livePrice = liveInst ? liveInst.price : (pos.currValPos / (pos.qty || 1));
+  const fxRate    = fx[currency] || 1;
+  // Bonds: qty is nominal face value, price is per 100 units
+  const isBond = subType === 'BOND';
+  const marketValueChf = subType === 'CASH'
+    ? pos.currValRef
+    : isBond
+      ? pos.qty * (livePrice / 100) * fxRate
+      : pos.qty * livePrice * fxRate;
+  const costChf = pos.histValRef || marketValueChf;
+
+  return {
+    id:             String(pos.id),
+    portfolioId:    String(containerId),
+    instrumentId:   ticker,
+    name:           pos.asset?.objNameList?.[0]?.name || pos.objNameList?.[0]?.name || ticker,
+    isin,
+    assetClass,
+    currency,
+    quantity:       pos.qty,
+    price:          livePrice ? +livePrice.toFixed(4) : 0,
+    marketValueChf: +marketValueChf.toFixed(2),
+    unrealizedPlChf: +(marketValueChf - costChf).toFixed(2),
+    iban:           pos.extn?.posIban?.[0]?.val || null,
+  };
+}
+
+function getContainerIdForPortfolio(portfolioId) {
+  // Map portfolio number (P-1001) to container ID (10001)
+  return Object.values(avaloqCache.containers).find(c =>
+    c.extn?.contNr?.some(n => n.val === portfolioId)
+  )?.id;
+}
+
+
 async function pollAndBroadcast(){
   const data = await fetchPrices();
   if(!data) return;
@@ -236,8 +401,12 @@ async function pollAndBroadcast(){
   // Recalculate lombard credits on each price tick
   if(Object.keys(lombardCredits).length>0) monitorLombardCredits();
 }
-setInterval(() => pollAndBroadcast().catch(e => console.error('poll error:', e.message)), 3000);
-pollAndBroadcast().catch(e => console.error('pollAndBroadcast error:', e.message)); // initial fetch
+setInterval(pollAndBroadcast, 3000);
+pollAndBroadcast(); // initial fetch
+
+// Avaloq cache: load on startup and refresh every 5 minutes
+refreshAvaloqCache();
+setInterval(refreshAvaloqCache, 5 * 60 * 1000);
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
 app.post('/api/v1/auth/login',(req,res)=>{
@@ -539,6 +708,30 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
 });
 
 
+
+
+// ── Price Server ──────────────────────────────────────────────────────────────
+const PRICE_SERVER_URL = process.env.PRICE_SERVER_URL || 'http://localhost:3002';
+
+async function fetchPrices() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/prices`);
+    if (!res.ok) throw new Error(`Price server ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error('Price server fetch error:', e.message);
+    return null;
+  }
+}
+
+async function fetchMarketOverview() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/market-overview`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    return data.data || {};
+  } catch { return {}; }
+}
 
 
 // ── Lombard Credit ────────────────────────────────────────────────────────────
