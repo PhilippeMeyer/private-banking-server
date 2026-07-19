@@ -111,27 +111,39 @@ for (const id of Object.keys(INSTRUMENTS)) drifts[id] = 0;
 async function fetchTwelveData(symbolMap) {
   if (!Object.keys(symbolMap).length) return {};
   const result = {};
-  // Single request for all symbols — 1 API credit per call
-  const allSymbols = Object.keys(symbolMap).join(',');
-  const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(allSymbols)}&apikey=${process.env.TWELVE_DATA_KEY||''}`;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) { console.error(`TwelveData HTTP ${res.status}`); return result; }
-    const data = await res.json();
-    if (data.price) {
-      // Single symbol response
-      const firstId = Object.values(symbolMap)[0];
-      const price = parseFloat(data.price);
-      if (!isNaN(price)) result[firstId] = price;
-    } else {
-      // Multi-symbol response
-      for (const [sym, id] of Object.entries(symbolMap)) {
-        const price = parseFloat(data[sym]?.price);
-        if (!isNaN(price)) result[id] = price;
-      }
+  // Batch into groups of 8 (rate limit: 8 credits/minute)
+  // Wait 62s between batches to stay within limit
+  const entries = Object.entries(symbolMap);
+  const batches = [];
+  for (let i = 0; i < entries.length; i += 8) batches.push(entries.slice(i, i + 8));
+  console.log(`TwelveData: fetching ${entries.length} symbols in ${batches.length} batches (~${batches.length} minutes)`);
+
+  for (let i = 0; i < batches.length; i++) {
+    if (i > 0) {
+      console.log(`TwelveData: waiting 62s before batch ${i+1}/${batches.length}...`);
+      await new Promise(r => setTimeout(r, 62000));
     }
-  } catch (e) {
-    console.error('TwelveData fetch error:', e.message);
+    const batch = batches[i];
+    const symbols = batch.map(([sym]) => sym).join(',');
+    const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbols)}&apikey=${process.env.TWELVE_DATA_KEY||''}`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) { console.error(`TwelveData HTTP ${res.status} batch ${i+1}`); continue; }
+      const data = await res.json();
+      if (data.price) {
+        const [, id] = batch[0];
+        const price = parseFloat(data.price);
+        if (!isNaN(price)) result[id] = price;
+      } else {
+        for (const [sym, id] of batch) {
+          const price = parseFloat(data[sym]?.price);
+          if (!isNaN(price)) result[id] = price;
+        }
+      }
+      console.log(`TwelveData: batch ${i+1}/${batches.length} done`);
+    } catch (e) {
+      console.error(`TwelveData batch ${i+1} error:`, e.message);
+    }
   }
   return result;
 }

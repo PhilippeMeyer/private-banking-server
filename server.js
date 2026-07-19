@@ -66,18 +66,100 @@ function authenticate(req, res, next) {
 }
 
 // ── Users & config ────────────────────────────────────────────────────────────
-const users = [
-  { id: 'u001', username: 'client',     password: 'client123',  name: 'Philippe Meyer',      role: 'PRIVATE_CLIENT',       portfolios: ['P-1001','P-1002','P-1003'], avaloqPersonId: 1001 },
-  { id: 'u002', username: 'rm',         password: 'rm123',      name: 'John Smith',           role: 'RELATIONSHIP_MANAGER' },
-  { id: 'u003', username: 'credit',     password: 'credit123',  name: 'Sarah Wilson',         role: 'CREDIT_OFFICER' },
-  { id: 'u004', username: 'admin',      password: 'admin123',   name: 'System Administrator', role: 'ADMIN' },
-  { id: 'u005', username: 'compliance', password: 'comp123',    name: 'Marie Dubois',         role: 'COMPLIANCE_OFFICER' },
-  { id: 'u006', username: 'sophie',     password: 'sophie123',  name: 'Sophie Meyer',         role: 'PRIVATE_CLIENT',       portfolios: [], coSignerFor: ['u001'], avaloqPersonId: 1002 },
+// ── Client users (linked to Avaloq persons) ──────────────────────────────────
+// In production: replaced by Avaloq OAuth2 / B2C auth
+// avaloqPersonId links to Avaloq obj_person.id
+const clientUsers = [
+  { id: 'u001', username: 'client', password: 'client123', name: 'Philippe Meyer',
+    role: 'PRIVATE_CLIENT', avaloqPersonId: 1001 },
+  { id: 'u006', username: 'sophie', password: 'sophie123', name: 'Sophie Meyer',
+    role: 'PRIVATE_CLIENT', avaloqPersonId: 1002 },
 ];
 
-const clientConfig = {
-  'u001': { coSignerId: 'u006', coSignerName: 'Sophie Meyer', coSignThreshold: 10000, rmThreshold: 50000 },
+// ── Staff directory (future: replaced by Entra ID / MSAL validation) ──────────
+// entraObjectId: Azure AD object ID (null until Entra integration)
+// assignedBpIds: BPs this staff member can access (future: defined in Entra groups)
+const STAFF_DIRECTORY = {
+  'S001': { id: 'S001', username: 'rm',         password: 'rm123',      name: 'John Smith',
+            role: 'RELATIONSHIP_MANAGER', email: 'john.smith@bank.com',
+            assignedBpIds: ['BP-001'], entraObjectId: null },
+  'S002': { id: 'S002', username: 'credit',      password: 'credit123',  name: 'Sarah Wilson',
+            role: 'CREDIT_OFFICER',       email: 'sarah.wilson@bank.com',
+            assignedBpIds: [],            entraObjectId: null },
+  'S003': { id: 'S003', username: 'compliance',  password: 'comp123',    name: 'Marie Dubois',
+            role: 'COMPLIANCE_OFFICER',   email: 'marie.dubois@bank.com',
+            assignedBpIds: [],            entraObjectId: null },
+  'S004': { id: 'S004', username: 'admin',       password: 'admin123',   name: 'System Administrator',
+            role: 'ADMIN',                email: 'admin@bank.com',
+            assignedBpIds: [],            entraObjectId: null },
 };
+
+// Combined lookup for backward compatibility during migration
+const users = [
+  ...clientUsers,
+  ...Object.values(STAFF_DIRECTORY).map(s => ({ ...s, portfolios: [] })),
+];
+
+// ── Co-signer config (BFF business rules — NOT from Avaloq) ─────────────────
+// Avaloq provides: who the CO_SIGNER is (via bpPersonRelList)
+// BFF defines: the threshold above which co-signing is required
+// Future: move thresholds to a product config service
+const CO_SIGN_THRESHOLD = 10000;   // CHF — require co-signer above this amount
+const RM_THRESHOLD      = 50000;   // CHF — require RM approval above this amount
+
+// Derive co-signer config dynamically from Avaloq cache
+function getClientConfig(userId) {
+  const clientUser = clientUsers.find(u => u.id === userId);
+  if (!clientUser) return null;
+
+  const personId = clientUser.avaloqPersonId;
+  // Find BPs where this person is an OWNER or ACCOUNT_HOLDER
+  const bpIds = avaloqCache.personToBps[personId] || [];
+
+  let coSignerId   = null;
+  let coSignerName = null;
+
+  for (const bpId of bpIds) {
+    const bp = avaloqCache.bps[bpId];
+    if (!bp) continue;
+    // Find CO_SIGNER in this BP's person relations
+    const coSignerRel = (bp.bpPersonRelList || []).find(r =>
+      r.authDet?.authRole?.intlId === 'CO_SIGNER' &&
+      r.trgObj?.id !== personId
+    );
+    if (coSignerRel) {
+      const coSignerPersonId = coSignerRel.trgObj?.id;
+      const coSignerPerson   = avaloqCache.persons[coSignerPersonId];
+      // Find BFF user linked to this Avaloq person
+      const coSignerUser = clientUsers.find(u => u.avaloqPersonId === coSignerPersonId);
+      coSignerId   = coSignerUser?.id || null;
+      coSignerName = coSignerPerson?.personNameList?.[0]?.fullName ||
+                     coSignerRel.trgObj?.objNameList?.[0]?.name || null;
+      break;
+    }
+  }
+
+  return {
+    coSignerId,
+    coSignerName,
+    coSignThreshold: CO_SIGN_THRESHOLD,
+    rmThreshold:     RM_THRESHOLD,
+  };
+}
+
+// Backward-compatible clientConfig (populated from Avaloq cache or fallback)
+const clientConfig = {
+  'u001': { coSignerId: 'u006', coSignerName: 'Sophie Meyer',
+            coSignThreshold: CO_SIGN_THRESHOLD, rmThreshold: RM_THRESHOLD },
+};
+
+// Refresh clientConfig from Avaloq cache after each cache refresh
+function refreshClientConfig() {
+  for (const u of clientUsers) {
+    const cfg = getClientConfig(u.id);
+    if (cfg) clientConfig[u.id] = cfg;
+  }
+}
 
 const roleTaskMap = {
   'COMPLIANCE_OFFICER':   ['staffReview', 'complianceValidation'],
@@ -107,32 +189,14 @@ const indices = {
   'Euro Stoxx 50':     { value: 4987.12, vol: 0.010 },
   'Swiss Market Index':{ value: 11792.30,vol: 0.007 },
 };
-const portfolioMeta = {
-  'P-1001': { name: 'Global Balanced Portfolio', mandate: 'Balanced',     currency: 'CHF', cash: 2458320.45, color: '#1A56DB' },
-  'P-1002': { name: 'Growth Equity Mandate',     mandate: 'Growth',       currency: 'CHF', cash: 842150.20,  color: '#8B5CF6' },
-  'P-1003': { name: 'Capital Preservation',      mandate: 'Conservative', currency: 'CHF', cash: 1240000.00, color: '#059669' },
+// ── Portfolio display config (presentation only — positions come from Avaloq) ──
+// Colors and mandates are display metadata — not core banking data
+const PORTFOLIO_DISPLAY = {
+  'P-1001': { color: '#1A56DB', mandate: 'Balanced' },
+  'P-1002': { color: '#059669', mandate: 'Swiss Equity' },
+  'P-1003': { color: '#7C3AED', mandate: 'Fixed Income' },
 };
-const positionBase = [
-  { id: 'POS-1',  portfolioId: 'P-1001', instrumentId: 'AAPL',   assetClass: 'Equities',     quantity: 1258  },
-  { id: 'POS-2',  portfolioId: 'P-1001', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 2000  },
-  { id: 'POS-3',  portfolioId: 'P-1001', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 10000 },
-  { id: 'POS-4',  portfolioId: 'P-1001', instrumentId: 'MSFT',   assetClass: 'Equities',     quantity: 420   },
-  { id: 'POS-5',  portfolioId: 'P-1001', instrumentId: 'NOVN',   assetClass: 'Equities',     quantity: 1800  },
-  { id: 'POS-6',  portfolioId: 'P-1001', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 5000  },
-  { id: 'POS-7',  portfolioId: 'P-1001', instrumentId: 'ZURN',   assetClass: 'Equities',     quantity: 150   },
-  { id: 'POS-8',  portfolioId: 'P-1002', instrumentId: 'AAPL',   assetClass: 'Equities',     quantity: 850   },
-  { id: 'POS-9',  portfolioId: 'P-1002', instrumentId: 'MSFT',   assetClass: 'Equities',     quantity: 620   },
-  { id: 'POS-10', portfolioId: 'P-1002', instrumentId: 'GOOGL',  assetClass: 'Equities',     quantity: 480   },
-  { id: 'POS-11', portfolioId: 'P-1002', instrumentId: 'CSCO',   assetClass: 'Equities',     quantity: 3200  },
-  { id: 'POS-12', portfolioId: 'P-1002', instrumentId: 'NOVN',   assetClass: 'Equities',     quantity: 900   },
-  { id: 'POS-13', portfolioId: 'P-1002', instrumentId: 'ROG',    assetClass: 'Equities',     quantity: 420   },
-  { id: 'POS-14', portfolioId: 'P-1003', instrumentId: 'BOND-1', assetClass: 'Fixed Income', quantity: 20000 },
-  { id: 'POS-15', portfolioId: 'P-1003', instrumentId: 'BOND-2', assetClass: 'Fixed Income', quantity: 15000 },
-  { id: 'POS-16', portfolioId: 'P-1003', instrumentId: 'BOND-3', assetClass: 'Fixed Income', quantity: 8000  },
-  { id: 'POS-17', portfolioId: 'P-1003', instrumentId: 'NESN',   assetClass: 'Equities',     quantity: 500   },
-  { id: 'POS-18', portfolioId: 'P-1003', instrumentId: 'ZURN',   assetClass: 'Equities',     quantity: 80    },
-];
-const costBasis = { 'AAPL':178,'NESN':88,'BOND-1':100,'MSFT':380,'NOVN':84,'GOOGL':155,'ROG':230,'UBS':25,'BOND-2':98,'BOND-3':99.5,'CSCO':48,'ZURN':480 };
+
 const transactions = [
   { id:'TX-1',portfolioId:'P-1001',tradeDate:'2025-05-23',settlementDate:'2025-05-27',type:'BUY',     instrument:'Apple Inc.',   instrumentId:'AAPL',  quantity:150, price:195.42,currency:'USD',amountChf:-26423.70,account:'Personal 12345678',    status:'SETTLED'},
   { id:'TX-2',portfolioId:'P-1001',tradeDate:'2025-05-22',settlementDate:'2025-05-26',type:'SELL',    instrument:'Nestlé SA',    instrumentId:'NESN',  quantity:200, price:92.18, currency:'CHF',amountChf:18436.00,  account:'Personal 12345678',    status:'SETTLED'},
@@ -150,12 +214,9 @@ function getLivePositions(portfolioId) {
     const cont = avaloqCache.containers[containerId];
     return (cont.posList || []).map(pos => avaloqPosToPosition(pos, portfolioId));
   }
-  // Legacy fallback (used if Avaloq cache not yet loaded)
-  return positionBase.filter(p=>p.portfolioId===portfolioId).map(p=>{
-    const inst=instruments[p.instrumentId], fxRate=fx[inst.currency]||1;
-    const mv=p.quantity*inst.price*fxRate, cost=p.quantity*(costBasis[p.instrumentId]||inst.price)*fxRate;
-    return { id:p.id,portfolioId:p.portfolioId,instrumentId:p.instrumentId,name:inst.name,isin:inst.isin,assetClass:p.assetClass,currency:inst.currency,quantity:p.quantity,price:+inst.price.toFixed(4),marketValueChf:+mv.toFixed(2),unrealizedPlChf:+(mv-cost).toFixed(2) };
-  });
+  // Avaloq cache not yet loaded — return empty (will populate on next cache refresh)
+  console.warn('getLivePositions: Avaloq cache empty for', portfolioId);
+  return [];
 }
 
 function getLivePortfolio(portfolioId) {
@@ -164,11 +225,11 @@ function getLivePortfolio(portfolioId) {
   const avqCont = containerId ? avaloqCache.containers[containerId] : null;
   
   // Get name and currency from Avaloq or fall back to meta
-  const name     = avqCont?.objNameList?.[0]?.name || portfolioMeta[portfolioId]?.name || portfolioId;
-  const currency = avqCont?.refCurry?.extn?.assetIso?.[0]?.val || portfolioMeta[portfolioId]?.currency || 'CHF';
-  const meta     = portfolioMeta[portfolioId];
-  const color    = meta?.color || '#1A56DB';
-  const mandate  = meta?.mandate || 'Balanced';
+  const name     = avqCont?.objNameList?.[0]?.name || portfolioId;
+  const currency = avqCont?.refCurry?.extn?.assetIso?.[0]?.val || 'CHF';
+  const display  = PORTFOLIO_DISPLAY[portfolioId] || {};
+  const color    = display.color    || '#1A56DB';
+  const mandate  = display.mandate  || 'Balanced';
 
   const positions = getLivePositions(portfolioId);
   const investedValue = positions.filter(p => p.assetClass !== 'Cash & Money Market')
@@ -206,16 +267,15 @@ function getAllPortfolios(userId) {
       .filter(Boolean);
     return portfolioIds.map(id => getLivePortfolio(id)).filter(Boolean);
   }
-  // Fallback to hardcoded portfolioMeta
-  return Object.keys(portfolioMeta).map(id=>getLivePortfolio(id));
+  // Avaloq cache not ready yet — return empty
+  return [];
 }
 function getMarketOverview(){ return Object.entries(indices).map(([name,idx])=>({name,value:+idx.value.toFixed(2),changePct:+(((idx.value/(idx.value/1.005))-1)*100).toFixed(2)})); }
 function getAggregatedDashboard(){
   const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0),totalDayChange=portfolios.reduce((s,p)=>s+p.dayChange,0);
   const portfolioAllocation=portfolios.map(p=>({portfolioId:p.id,name:p.name,mandate:p.mandate,color:p.color,value:p.value,pct:+((p.value/totalAum)*100).toFixed(1)}));
-  const allPositions=Object.keys(portfolioMeta).flatMap(id=>getLivePositions(id)),byClass={};
+  const allPositions=portfolios.flatMap(p=>getLivePositions(p.id)),byClass={};
   for(const p of allPositions) byClass[p.assetClass]=(byClass[p.assetClass]||0)+p.marketValueChf;
-  byClass['Cash & Money Market']=(byClass['Cash & Money Market']||0)+Object.values(portfolioMeta).reduce((s,m)=>s+m.cash,0);
   const assetAllocation=Object.entries(byClass).map(([assetClass,valueChf])=>({assetClass,pct:+((valueChf/totalAum)*100).toFixed(1),valueChf:+valueChf.toFixed(0)}));
   return { totalAum:+totalAum.toFixed(2),totalDayChange:+totalDayChange.toFixed(2),totalDayChangePct:+((totalDayChange/(totalAum-totalDayChange))*100).toFixed(2),portfolios,portfolioAllocation,assetAllocation,marketOverview:getMarketOverview(),recentActivity:transactions.slice(0,5),unreadNotifications:0 };
 }
@@ -232,7 +292,58 @@ function broadcast(payload){ const msg=JSON.stringify(payload); for(const ws of 
 
 // ── Simulation ────────────────────────────────────────────────────────────────
 
-// ── Avaloq Mock Client ────────────────────────────────────────────────────────
+// ── Price Server ──────────────────────────────────────────────────────────────
+const PRICE_SERVER_URL = process.env.PRICE_SERVER_URL || 'http://localhost:3002';
+
+async function fetchPrices() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/prices`);
+    if (!res.ok) throw new Error(`Price server ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error('Price server fetch error:', e.message);
+    return null;
+  }
+}
+
+async function fetchMarketOverview() {
+  try {
+    const res = await fetch(`${PRICE_SERVER_URL}/market-overview`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    return data.data || {};
+  } catch { return {}; }
+}
+
+
+async function pollAndBroadcast(){
+  const data = await fetchPrices();
+  if(!data) return;
+  const priceData  = data.data  || {};
+  const fxData     = data.fx    || {};
+  const marketData = data.marketOverview || {};
+  // Update local fx
+  Object.assign(fx, fxData);
+  // Update instrument prices from price server
+  const priceChanges=[];
+  for(const [id,inst] of Object.entries(instruments)){
+    const pd = priceData[id];
+    if(!pd) continue;
+    const prev = inst.price;
+    inst.price = pd.price;
+    priceChanges.push({instrumentId:id,prev:+prev.toFixed(4),price:+inst.price.toFixed(4),currency:inst.currency});
+  }
+  // Update indices from market overview
+  for(const [name,val] of Object.entries(marketData)){
+    if(indices[name]) indices[name].value = val.value;
+  }
+  const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0);
+  broadcast({eventId:'EVT-'+Date.now(),source:'MARKET_DATA',eventType:'PRICE_UPDATED',occurredAt:now(),payload:{prices:priceChanges,portfolios,totalAum:+totalAum.toFixed(2),marketOverview:getMarketOverview()}});
+  // Recalculate lombard credits on each price tick
+  if(Object.keys(lombardCredits).length>0) monitorLombardCredits();
+}
+
+
 const AVALOQ_BASE_URL = process.env.AVALOQ_BASE_URL || 'http://localhost:3003/api1';
 
 // Server-to-server token: BFF has full access to Avaloq
@@ -322,6 +433,8 @@ async function refreshAvaloqCache() {
 
     avaloqCache.lastRefresh = new Date().toISOString();
     console.log(`Avaloq cache: ${Object.keys(avaloqCache.containers).length} containers, ${Object.keys(avaloqCache.bps).length} BPs, ${Object.keys(avaloqCache.persons).length} persons`);
+    // Refresh BFF config from Avaloq data
+    refreshClientConfig();
   } catch(e) {
     console.error('Avaloq cache refresh error:', e.message);
   }
@@ -330,7 +443,7 @@ async function refreshAvaloqCache() {
 // ── Portfolio helpers using Avaloq data ───────────────────────────────────────
 // Maps Avaloq container position to BFF position format
 function avaloqPosToPosition(pos, containerId) {
-  const ticker   = pos.extn?.posSym?.[0]?.val || pos.asset?.extn?.assetTkn?.[0]?.val || 'UNKNOWN';
+  const ticker   = pos.extn?.posSym?.[0]?.val || pos.asset?.extn?.assetTkn?.[0]?.val || pos.asset?.extn?.assetIso?.[0]?.val || 'UNKNOWN';
   const isin     = pos.asset?.extn?.assetIsin?.[0]?.val || '';
   const currency = pos.asset?.nomCurry?.extn?.assetIso?.[0]?.val || 'CHF';
   const subType  = pos.objSubType?.intlId || 'SECURITY';
@@ -342,7 +455,6 @@ function avaloqPosToPosition(pos, containerId) {
   const liveInst = instruments[ticker];
   const livePrice = liveInst ? liveInst.price : (pos.currValPos / (pos.qty || 1));
   const fxRate    = fx[currency] || 1;
-  // Bonds: qty is nominal face value, price is per 100 units
   const isBond = subType === 'BOND';
   const marketValueChf = subType === 'CASH'
     ? pos.currValRef
@@ -375,32 +487,6 @@ function getContainerIdForPortfolio(portfolioId) {
 }
 
 
-async function pollAndBroadcast(){
-  const data = await fetchPrices();
-  if(!data) return;
-  const priceData  = data.data  || {};
-  const fxData     = data.fx    || {};
-  const marketData = data.marketOverview || {};
-  // Update local fx
-  Object.assign(fx, fxData);
-  // Update instrument prices from price server
-  const priceChanges=[];
-  for(const [id,inst] of Object.entries(instruments)){
-    const pd = priceData[id];
-    if(!pd) continue;
-    const prev = inst.price;
-    inst.price = pd.price;
-    priceChanges.push({instrumentId:id,prev:+prev.toFixed(4),price:+inst.price.toFixed(4),currency:inst.currency});
-  }
-  // Update indices from market overview
-  for(const [name,val] of Object.entries(marketData)){
-    if(indices[name]) indices[name].value = val.value;
-  }
-  const portfolios=getAllPortfolios(),totalAum=portfolios.reduce((s,p)=>s+p.value,0);
-  broadcast({eventId:'EVT-'+Date.now(),source:'MARKET_DATA',eventType:'PRICE_UPDATED',occurredAt:now(),payload:{prices:priceChanges,portfolios,totalAum:+totalAum.toFixed(2),marketOverview:getMarketOverview()}});
-  // Recalculate lombard credits on each price tick
-  if(Object.keys(lombardCredits).length>0) monitorLombardCredits();
-}
 setInterval(pollAndBroadcast, 3000);
 pollAndBroadcast(); // initial fetch
 
@@ -410,9 +496,21 @@ setInterval(refreshAvaloqCache, 5 * 60 * 1000);
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
 app.post('/api/v1/auth/login',(req,res)=>{
-  const{username,password}=req.body, user=users.find(u=>u.username===username&&u.password===password);
+  const{username,password}=req.body;
+  // Check client users first
+  let user = clientUsers.find(u=>u.username===username&&u.password===password);
+  let isStaff = false;
+  // Then check staff directory
+  if (!user) {
+    const staffUser = Object.values(STAFF_DIRECTORY).find(s=>s.username===username&&s.password===password);
+    if (staffUser) { user = staffUser; isStaff = true; }
+  }
   if(!user) return res.status(401).json({error:{code:'AUTH_FAILED',message:'Invalid credentials'}});
-  const token=Buffer.from(JSON.stringify({userId:user.id,role:user.role})).toString('base64');
+  const tokenPayload = {
+    userId: user.id, role: user.role,
+    ...(isStaff ? { staffId: user.id, entraObjectId: user.entraObjectId } : { avaloqPersonId: user.avaloqPersonId }),
+  };
+  const token=Buffer.from(JSON.stringify(tokenPayload)).toString('base64');
   res.json({accessToken:token,tokenType:'Bearer',expiresIn:3600,user:{id:user.id,name:user.name,role:user.role}});
 });
 
@@ -710,30 +808,437 @@ app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
 
 
 
-// ── Price Server ──────────────────────────────────────────────────────────────
-const PRICE_SERVER_URL = process.env.PRICE_SERVER_URL || 'http://localhost:3002';
 
-async function fetchPrices() {
+// ── Avaloq data cache ─────────────────────────────────────────────────────────
+// Populated at startup and refreshed every 5 minutes
+// BFF enriches this with live prices from the price server
+
+async function refreshAvaloqCache() {
+  console.log('Refreshing Avaloq cache...');
   try {
-    const res = await fetch(`${PRICE_SERVER_URL}/prices`);
-    if (!res.ok) throw new Error(`Price server ${res.status}`);
-    return await res.json();
-  } catch (e) {
-    console.error('Price server fetch error:', e.message);
-    return null;
+    // 1. Load all containers (positions) — using system token
+    const containers = await avaloqGet('/obj-conts%2Bgetaccounts?limit=200');
+    if (containers) {
+      avaloqCache.containers = {};
+      for (const c of containers) {
+        avaloqCache.containers[c.id] = c;
+      }
+    }
+
+    // 2. Load BPs with access rights (who owns/controls them)
+    const bps = await avaloqGet('/obj-bps%2Bavq_acc_owner_name?limit=200');
+    if (bps) {
+      avaloqCache.bps = {};
+      avaloqCache.personToBps = {};
+      for (const bp of bps) {
+        avaloqCache.bps[bp.id] = bp;
+        // Build person → BP mapping from bpPersonRelList
+        for (const rel of bp.bpPersonRelList || []) {
+          const pid = rel.trgObj?.id;
+          if (pid) {
+            if (!avaloqCache.personToBps[pid]) avaloqCache.personToBps[pid] = [];
+            if (!avaloqCache.personToBps[pid].includes(bp.id))
+              avaloqCache.personToBps[pid].push(bp.id);
+          }
+        }
+      }
+    }
+
+    // 3. Load persons
+    const persons = await avaloqGet('/obj-persons?limit=200');
+    if (persons) {
+      avaloqCache.persons = {};
+      for (const p of persons) avaloqCache.persons[p.id] = p;
+    }
+
+    // 4. Build BP → containers mapping from container._bpId
+    // (containers have _bpId but we sanitize it — use BP's containerIds from mock)
+    // Since mock uses numeric bpId in containers, we rebuild from BP list
+    avaloqCache.bpToContainers = {};
+    for (const c of Object.values(avaloqCache.containers)) {
+      // Each container's extn.contNr tells us the account number
+      // BFF links containers to BPs via the person access chain
+      // For now: all containers accessible to a person are linked to their BPs
+    }
+
+    avaloqCache.lastRefresh = new Date().toISOString();
+    console.log(`Avaloq cache: ${Object.keys(avaloqCache.containers).length} containers, ${Object.keys(avaloqCache.bps).length} BPs, ${Object.keys(avaloqCache.persons).length} persons`);
+    // Refresh BFF config from Avaloq data
+    refreshClientConfig();
+  } catch(e) {
+    console.error('Avaloq cache refresh error:', e.message);
   }
 }
 
-async function fetchMarketOverview() {
-  try {
-    const res = await fetch(`${PRICE_SERVER_URL}/market-overview`);
-    if (!res.ok) return {};
-    const data = await res.json();
-    return data.data || {};
-  } catch { return {}; }
+// ── Portfolio helpers using Avaloq data ───────────────────────────────────────
+// Maps Avaloq container position to BFF position format
+function avaloqPosToPosition(pos, containerId) {
+  const ticker   = pos.extn?.posSym?.[0]?.val || pos.asset?.extn?.assetTkn?.[0]?.val || pos.asset?.extn?.assetIso?.[0]?.val || 'UNKNOWN';
+  const isin     = pos.asset?.extn?.assetIsin?.[0]?.val || '';
+  const currency = pos.asset?.nomCurry?.extn?.assetIso?.[0]?.val || 'CHF';
+  const subType  = pos.objSubType?.intlId || 'SECURITY';
+  const assetClass = subType === 'CASH' ? 'Cash & Money Market'
+                   : subType === 'BOND' ? 'Fixed Income'
+                   : 'Equities';
+
+  // Enrich with live price from price server
+  const liveInst = instruments[ticker];
+  const livePrice = liveInst ? liveInst.price : (pos.currValPos / (pos.qty || 1));
+  const fxRate    = fx[currency] || 1;
+  const isBond = subType === 'BOND';
+  const marketValueChf = subType === 'CASH'
+    ? pos.currValRef
+    : isBond
+      ? pos.qty * (livePrice / 100) * fxRate
+      : pos.qty * livePrice * fxRate;
+  const costChf = pos.histValRef || marketValueChf;
+
+  return {
+    id:             String(pos.id),
+    portfolioId:    String(containerId),
+    instrumentId:   ticker,
+    name:           pos.asset?.objNameList?.[0]?.name || pos.objNameList?.[0]?.name || ticker,
+    isin,
+    assetClass,
+    currency,
+    quantity:       pos.qty,
+    price:          livePrice ? +livePrice.toFixed(4) : 0,
+    marketValueChf: +marketValueChf.toFixed(2),
+    unrealizedPlChf: +(marketValueChf - costChf).toFixed(2),
+    iban:           pos.extn?.posIban?.[0]?.val || null,
+  };
+}
+
+function getContainerIdForPortfolio(portfolioId) {
+  // Map portfolio number (P-1001) to container ID (10001)
+  return Object.values(avaloqCache.containers).find(c =>
+    c.extn?.contNr?.some(n => n.val === portfolioId)
+  )?.id;
 }
 
 
+setInterval(pollAndBroadcast, 3000);
+pollAndBroadcast(); // initial fetch
+
+// Avaloq cache: load on startup and refresh every 5 minutes
+refreshAvaloqCache();
+setInterval(refreshAvaloqCache, 5 * 60 * 1000);
+
+// ── Auth endpoints ────────────────────────────────────────────────────────────
+app.post('/api/v1/auth/login',(req,res)=>{
+  const{username,password}=req.body;
+  // Check client users first
+  let user = clientUsers.find(u=>u.username===username&&u.password===password);
+  let isStaff = false;
+  // Then check staff directory
+  if (!user) {
+    const staffUser = Object.values(STAFF_DIRECTORY).find(s=>s.username===username&&s.password===password);
+    if (staffUser) { user = staffUser; isStaff = true; }
+  }
+  if(!user) return res.status(401).json({error:{code:'AUTH_FAILED',message:'Invalid credentials'}});
+  const tokenPayload = {
+    userId: user.id, role: user.role,
+    ...(isStaff ? { staffId: user.id, entraObjectId: user.entraObjectId } : { avaloqPersonId: user.avaloqPersonId }),
+  };
+  const token=Buffer.from(JSON.stringify(tokenPayload)).toString('base64');
+  res.json({accessToken:token,tokenType:'Bearer',expiresIn:3600,user:{id:user.id,name:user.name,role:user.role}});
+});
+
+app.get('/api/v1/clients/me/config',authenticate,(req,res)=>{
+  const config=clientConfig[req.user.userId];
+  res.json({data:config||{coSignThreshold:null,rmThreshold:null,coSignerId:null,coSignerName:null}});
+});
+
+app.post('/auth/fcm-token',authenticate,(req,res)=>{
+  const{fcmToken}=req.body; if(!fcmToken) return res.status(400).json({error:'Missing fcmToken'});
+  fcmTokens[req.user.userId]=fcmToken; saveTokens();
+  console.log(`FCM token registered for user ${req.user.userId}`);
+  res.json({success:true});
+});
+
+app.post('/auth/web-challenge',async(req,res)=>{
+  const{username,password}=req.body, user=users.find(u=>u.username===username&&u.password===password);
+  if(!user) return res.status(401).json({error:{code:'AUTH_FAILED',message:'Invalid credentials'}});
+  const fcmToken=fcmTokens[user.id];
+  if(!fcmToken) return res.status(400).json({error:{code:'NO_MOBILE_DEVICE',message:'No mobile device registered. Please log in via the mobile app first.'}});
+  const challengeId='CHG-'+Date.now()+'-'+Math.random().toString(36).substr(2,9), expiresAt=Date.now()+3*60*1000;
+  authChallenges[challengeId]={userId:user.id,status:'PENDING',expiresAt,ipAddress:req.headers['x-forwarded-for']||req.ip||'Unknown',createdAt:now()};
+  await sendPush(fcmToken,{title:'🔐 New login request',body:'Someone is trying to log into your account. Tap to approve or reject.',data:{type:'WEB_LOGIN_CHALLENGE',challengeId,userName:user.name,ipAddress:authChallenges[challengeId].ipAddress,timestamp:authChallenges[challengeId].createdAt}});
+  res.json({challengeId,expiresAt});
+});
+
+app.get('/auth/web-challenge/:id/status',(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(Date.now()>c.expiresAt) c.status='EXPIRED';
+  if(c.status==='APPROVED'){
+    const user=users.find(u=>u.id===c.userId), token=Buffer.from(JSON.stringify({userId:user.id,role:user.role})).toString('base64');
+    delete authChallenges[req.params.id];
+    return res.json({status:'APPROVED',accessToken:token,user:{id:user.id,name:user.name,role:user.role}});
+  }
+  res.json({status:c.status,expiresAt:c.expiresAt});
+});
+
+app.post('/auth/web-challenge/:id/approve',authenticate,(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(Date.now()>c.expiresAt) return res.status(400).json({error:'Expired'});
+  if(c.userId!==req.user.userId) return res.status(403).json({error:'Forbidden'});
+  c.status='APPROVED'; res.json({success:true});
+});
+
+app.post('/auth/web-challenge/:id/reject',authenticate,(req,res)=>{
+  const c=authChallenges[req.params.id]; if(!c) return res.status(404).json({error:'Not found'});
+  if(c.userId!==req.user.userId) return res.status(403).json({error:'Forbidden'});
+  c.status='REJECTED'; delete authChallenges[req.params.id]; res.json({success:true});
+});
+
+// ── Portfolio endpoints ───────────────────────────────────────────────────────
+app.get('/health',(req,res)=>res.json({status:'ok',version:SERVER_VERSION,service:'private-banking-pi',firebase:firebaseInitialized,uptime:Math.floor(process.uptime()),timestamp:now()}));
+app.get('/bff/mobile/dashboard',(req,res)=>res.json(response(getAggregatedDashboard())));
+app.get('/portfolios',(req,res)=>res.json(response(getAllPortfolios())));
+app.get('/portfolios/:id',(req,res)=>res.json(response(getLivePortfolio(req.params.id))));
+app.get('/portfolios/:id/positions',(req,res)=>{
+  const positions=getLivePositions(req.params.id), portfolio=getLivePortfolio(req.params.id);
+  if(!portfolio) return res.status(404).json({error:'Not found'});
+  res.json(response(positions.map(p=>({...p,weightPct:+((p.marketValueChf/portfolio.value)*100).toFixed(2)}))));
+});
+app.get('/portfolios/:id/performance',(req,res)=>res.json(response({portfolioId:req.params.id,twr:{mtd:1.25,ytd:7.62,oneYear:12.35,threeYearAnnualized:8.91},mwr:{ytd:7.10,sinceInception:7.85},benchmark:{name:'MSCI World',ytd:5.18},excessReturnYtd:2.44})));
+app.get('/portfolios/:id/allocation',(req,res)=>res.json(response(getLivePortfolio(req.params.id)?.allocation||[])));
+app.get('/portfolios/:id/profitability',(req,res)=>{
+  const positions=getLivePositions(req.params.id), unrealized=positions.reduce((s,p)=>s+p.unrealizedPlChf,0);
+  res.json(response({portfolioId:req.params.id,realizedPlChf:245678.90,unrealizedPlChf:+unrealized.toFixed(2),incomeChf:78342.15,feesChf:-23456.78,totalNetProfitabilityChf:+(unrealized+245678.90+78342.15-23456.78).toFixed(2)}));
+});
+app.get('/portfolios/:id/cash',(req,res)=>res.json(response({portfolioId:req.params.id,totalCashChf:2458320.45,availableToInvestChf:1985410.22,pendingChf:312450.13,restrictedChf:160460.10,currencies:[{currency:'CHF',total:1250450.10,valueChf:1250450.10,pct:50.9},{currency:'USD',total:895210.35,valueChf:816422.71,pct:33.2},{currency:'EUR',total:210430.80,valueChf:207640.77,pct:8.4}]})));
+app.get('/transactions',(req,res)=>{ const{portfolioId}=req.query; res.json(response(portfolioId?transactions.filter(t=>t.portfolioId===portfolioId):transactions)); });
+app.get('/marketdata/indices',(req,res)=>res.json(response(getMarketOverview())));
+app.get('/notifications',(req,res)=>res.json(response([])));
+
+// ── Beneficiaries ─────────────────────────────────────────────────────────────
+app.get('/beneficiaries',authenticate,(req,res)=>res.json({data:beneficiaries[req.user.userId]||[]}));
+
+app.post('/beneficiaries',authenticate,async(req,res)=>{
+  const{beneficiaryName,iban,bankName,bankCountry,currency}=req.body;
+  if(!beneficiaryName||!iban) return res.status(400).json({error:'Missing required fields'});
+  const user=users.find(u=>u.id===req.user.userId), beneficiaryId='BEN-'+Date.now();
+  if(!beneficiaries[req.user.userId]) beneficiaries[req.user.userId]=[];
+  const beneficiary={id:beneficiaryId,beneficiaryName,iban,bankName:bankName||'',bankCountry:bankCountry||'',currency:currency||'CHF',status:'PENDING_APPROVAL',requestedAt:now(),customerId:req.user.userId,customerName:user.name};
+  beneficiaries[req.user.userId].push(beneficiary);
+  try{
+    const proc=await flowable('POST','/runtime/process-instances',{processDefinitionKey:'beneficiaryRegistration',businessKey:beneficiaryId,variables:[
+      {name:'beneficiaryId',value:beneficiaryId,type:'string'},{name:'beneficiaryName',value:beneficiaryName,type:'string'},
+      {name:'iban',value:iban,type:'string'},{name:'bankName',value:bankName||'',type:'string'},
+      {name:'bankCountry',value:bankCountry||'',type:'string'},{name:'currency',value:currency||'CHF',type:'string'},
+      {name:'customerId',value:req.user.userId,type:'string'},{name:'customerName',value:user.name,type:'string'},
+      {name:'requestedAt',value:now(),type:'string'},
+    ]});
+    beneficiary.processInstanceId=proc.id;
+    console.log(`Beneficiary process started: ${proc.id}`);
+  }catch(e){console.error('Flowable error:',e.message);}
+  res.status(201).json({data:beneficiary});
+});
+
+app.get('/beneficiaries/:id',authenticate,(req,res)=>{
+  const b=(beneficiaries[req.user.userId]||[]).find(b=>b.id===req.params.id);
+  if(!b) return res.status(404).json({error:'Not found'});
+  res.json({data:b});
+});
+
+app.delete('/beneficiaries/:id',authenticate,(req,res)=>{
+  const list=beneficiaries[req.user.userId]||[], idx=list.findIndex(b=>b.id===req.params.id);
+  if(idx===-1) return res.status(404).json({error:'Not found'});
+  list.splice(idx,1); res.json({success:true});
+});
+
+// ── Payments ──────────────────────────────────────────────────────────────────
+app.get('/payments',authenticate,(req,res)=>{
+  const userPayments=Object.values(payments).filter(p=>p.customerId===req.user.userId||p.coSignerId===req.user.userId);
+  res.json({data:userPayments.sort((a,b)=>new Date(b.initiatedAt)-new Date(a.initiatedAt))});
+});
+
+app.post('/payments',authenticate,async(req,res)=>{
+  const{beneficiaryId,amount,currency,reference,portfolioId}=req.body;
+  if(!beneficiaryId||!amount) return res.status(400).json({error:'Missing required fields'});
+  const user=users.find(u=>u.id===req.user.userId), config=clientConfig[req.user.userId];
+  const bList=beneficiaries[req.user.userId]||[], beneficiary=bList.find(b=>b.id===beneficiaryId&&b.status==='ACTIVE');
+  if(!beneficiary) return res.status(400).json({error:'Beneficiary not found or not active'});
+  const paymentId='PAY-'+Date.now(), amountNum=parseFloat(amount);
+  const coSignTh=config?.coSignThreshold||10000, rmTh=config?.rmThreshold||50000;
+  const payment={
+    id:paymentId,customerId:req.user.userId,customerName:user.name,
+    coSignerId:config?.coSignerId||null,coSignerName:config?.coSignerName||null,
+    beneficiaryId,beneficiaryName:beneficiary.beneficiaryName,iban:beneficiary.iban,bankName:beneficiary.bankName,
+    amount:amountNum,currency:currency||beneficiary.currency||'CHF',reference:reference||'',
+    portfolioId:portfolioId||user.portfolios?.[0]||'P-1001',status:'PENDING',
+    approvalPath:amountNum<=coSignTh?'STRAIGHT_THROUGH':amountNum<=rmTh?'CO_SIGNER':'CO_SIGNER_AND_RM',
+    initiatedAt:now(),
+  };
+  payments[paymentId]=payment;
+  try{
+    const proc=await flowable('POST','/runtime/process-instances',{processDefinitionKey:'paymentApproval',businessKey:paymentId,variables:[
+      {name:'paymentId',value:paymentId,type:'string'},{name:'customerId',value:req.user.userId,type:'string'},
+      {name:'customerName',value:user.name,type:'string'},{name:'coSignerId',value:config?.coSignerId||'',type:'string'},
+      {name:'coSignerName',value:config?.coSignerName||'',type:'string'},{name:'beneficiaryId',value:beneficiaryId,type:'string'},
+      {name:'beneficiaryName',value:beneficiary.beneficiaryName,type:'string'},{name:'iban',value:beneficiary.iban,type:'string'},
+      {name:'bankName',value:beneficiary.bankName||'',type:'string'},{name:'amount',value:amountNum,type:'double'},
+      {name:'currency',value:payment.currency,type:'string'},{name:'reference',value:payment.reference,type:'string'},
+      {name:'portfolioId',value:payment.portfolioId,type:'string'},
+    ]});
+    payment.processInstanceId=proc.id;
+    console.log(`Payment process started: ${proc.id} for ${paymentId} (${amountNum} ${payment.currency})`);
+  }catch(e){console.error('Payment Flowable error:',e.message);}
+  if(amountNum>coSignTh&&config?.coSignerId){
+    const tok=fcmTokens[config.coSignerId];
+    if(tok) await sendPush(tok,{title:'💳 Payment Approval Required',body:`${user.name} wants to send ${payment.currency} ${amountNum.toLocaleString()} to ${beneficiary.beneficiaryName}`,data:{type:'PAYMENT_CO_SIGN',paymentId,customerId:req.user.userId,amount:String(amountNum),currency:payment.currency,beneficiaryName:beneficiary.beneficiaryName,iban:beneficiary.iban,customerName:user.name,reference:payment.reference}});
+  }
+  res.status(201).json({data:payment});
+});
+
+app.get('/payments/pending/cosign',authenticate,async(req,res)=>{
+  try{
+    const data=await flowable('GET',`/runtime/tasks?assignee=${req.user.userId}&processDefinitionKey=paymentApproval&size=50`);
+    const tasks=await Promise.all((data.data||[]).map(async task=>{
+      try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{taskId:task.id,...varMap}; }
+      catch{ return{taskId:task.id}; }
+    }));
+    res.json({data:tasks});
+  }catch(e){res.status(502).json({error:'Flowable unavailable'});}
+});
+
+app.post('/payments/:paymentId/cosign',authenticate,async(req,res)=>{
+  const{decision,comment}=req.body, payment=payments[req.params.paymentId];
+  if(!payment) return res.status(404).json({error:'Payment not found'});
+  if(payment.coSignedAt) return res.status(400).json({error:'Payment already co-signed'});
+  payment.coSignedAt=now(); payment.coSignedBy=req.user.userId; payment.status='CO_SIGNED';
+  res.json({success:true,decision});
+  setImmediate(async()=>{
+    try{
+      const data=await flowable('GET',`/runtime/tasks?processInstanceId=${payment.processInstanceId}&size=10`);
+      const task=(data.data||[]).find(t=>t.name==='Co-Signer Approval');
+      if(!task){console.error('Co-sign task not found for',req.params.paymentId);return;}
+      await flowable('POST',`/runtime/tasks/${task.id}`,{action:'complete',variables:[
+        {name:'coSignerDecision',value:decision,type:'string'},{name:'coSignerComment',value:comment||'',type:'string'},
+        {name:'coSignedAt',value:now(),type:'string'},{name:'coSignedBy',value:req.user.userId,type:'string'},
+      ]});
+      console.log(`Co-sign task ${task.id} completed: ${decision} for payment ${req.params.paymentId}`);
+    }catch(e){console.error('Co-sign background error:',e.message);}
+  });
+});
+
+// ── Workflow tasks ────────────────────────────────────────────────────────────
+app.get('/workflow/tasks',authenticate,async(req,res)=>{
+  try{
+    const[beneficiaryData,paymentData,documentData,lombardData]=await Promise.all([
+      flowable('GET','/runtime/tasks?processDefinitionKey=beneficiaryRegistration&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=paymentApproval&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=paymentDocumentApproval&size=50'),
+      flowable('GET','/runtime/tasks?processDefinitionKey=lombardCredit&size=50'),
+    ]);
+    const allTasks=[...(beneficiaryData.data||[]),...(paymentData.data||[]),...(documentData.data||[]),...(lombardData.data||[])];
+    const tasks=await Promise.all(allTasks.map(async task=>{
+      try{ const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`); const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value); return{...task,variables:varMap}; }
+      catch{return{...task,variables:{}};}
+    }));
+    const allowedTasks=roleTaskMap[req.user.role]||null;
+    const filtered=allowedTasks?tasks.filter(t=>allowedTasks.includes(t.taskDefinitionKey)):tasks;
+    res.json({data:filtered,total:filtered.length});
+  }catch(e){console.error('Flowable tasks error:',e.message);res.status(502).json({error:'Flowable unavailable',detail:e.message});}
+});
+
+app.get('/workflow/tasks/:taskId',authenticate,async(req,res)=>{
+  try{
+    const task=await flowable('GET',`/runtime/tasks/${req.params.taskId}`);
+    const vars=await flowable('GET',`/runtime/process-instances/${task.processInstanceId}/variables`);
+    const varMap={}; (vars||[]).forEach(v=>varMap[v.name]=v.value);
+    res.json({data:{...task,variables:varMap}});
+  }catch(e){res.status(502).json({error:'Flowable unavailable'});}
+});
+
+app.post('/workflow/tasks/:taskId/complete',authenticate,async(req,res)=>{
+  const{decision,staffComment}=req.body;
+  if(!decision) return res.status(400).json({error:'decision required'});
+  res.json({success:true,decision});
+  setImmediate(async()=>{
+    try{
+      const task=await flowable('GET',`/runtime/tasks/${req.params.taskId}`);
+      const taskKey=task.taskDefinitionKey;
+      const decisionVar=taskKey==='coSignerApproval'?'coSignerDecision':taskKey==='rmApproval'?'rmDecision':'decision';
+      const commentVar=taskKey==='rmApproval'?'rmComment':'staffComment';
+      await flowable('POST',`/runtime/tasks/${req.params.taskId}`,{action:'complete',variables:[
+        {name:decisionVar,value:decision,type:'string'},{name:commentVar,value:staffComment||'',type:'string'},
+        {name:'reviewedBy',value:req.user.userId,type:'string'},{name:'reviewedAt',value:now(),type:'string'},
+      ]});
+      console.log(`Task ${req.params.taskId} completed: ${decision} (${taskKey})`);
+
+      // Fetch historic variables
+      const histVars=await flowable('GET',`/history/historic-variable-instances?processInstanceId=${task.processInstanceId}`);
+      const varMap={};
+      (histVars?.data||[]).forEach(v=>{ const name=v.variable?.name??v.variableName, value=v.variable?.value??v.value; if(name) varMap[name]=value; });
+
+      const paymentId=varMap.paymentId, beneficiaryName=varMap.beneficiaryName, customerId=varMap.customerId;
+
+      // Beneficiary notification
+      if(beneficiaryName&&!paymentId){
+        const iban=varMap.iban||'';
+        const notificationType=decision==='APPROVE'?'BENEFICIARY_APPROVED':'BENEFICIARY_REJECTED_STAFF';
+        const list=Object.values(beneficiaries).flat(), b=list.find(b=>b.beneficiaryName===beneficiaryName&&b.iban===iban);
+        if(b){ b.status=decision==='APPROVE'?'ACTIVE':'REJECTED'; b.resolvedAt=now(); if(staffComment) b.staffComment=staffComment; broadcast({eventType:'BENEFICIARY_UPDATED',payload:b,occurredAt:now()}); }
+        const fcmToken=fcmTokens[customerId];
+        if(fcmToken){
+          const msgs={BENEFICIARY_APPROVED:{title:'✅ Beneficiary Approved',body:`${beneficiaryName} is now active.`},BENEFICIARY_REJECTED_STAFF:{title:'❌ Beneficiary Registration Declined',body:`${beneficiaryName} was declined.${staffComment?' Reason: '+staffComment:''}`}};
+          if(msgs[notificationType]) await sendPush(fcmToken,{...msgs[notificationType],data:{type:notificationType,beneficiaryName,iban,customerId}});
+        }
+      }
+
+      // Payment notifications
+      if(paymentId){
+        const payment=payments[paymentId];
+        if(decision==='REJECT'){
+          // Rejected by RM or co-signer
+          if(payment) { payment.status='REJECTED'; payment.resolvedAt=now(); broadcast({eventType:'PAYMENT_UPDATED',payload:payment,occurredAt:now()}); }
+          const fcmToken=fcmTokens[customerId];
+          const rejectedBy=taskKey==='rmApproval'?'your Relationship Manager':'co-signer';
+          if(fcmToken&&payment) await sendPush(fcmToken,{title:'❌ Payment Declined',body:`Your payment to ${payment.beneficiaryName} was declined by ${rejectedBy}.${staffComment?' Reason: '+staffComment:''}`,data:{type:taskKey==='rmApproval'?'PAYMENT_REJECTED_RM':'PAYMENT_REJECTED_COSIGNER',paymentId,customerId}});
+        } else if(decision==='APPROVE'&&(taskKey==='rmApproval'||(taskKey==='coSignerApproval'&&payment?.approvalPath==='CO_SIGNER'))){
+          // Approved — execute payment
+          if(payment) { payment.status='EXECUTED'; payment.resolvedAt=now(); broadcast({eventType:'PAYMENT_UPDATED',payload:payment,occurredAt:now()}); }
+          const fcmToken=fcmTokens[customerId];
+          if(fcmToken&&payment) await sendPush(fcmToken,{title:'✅ Payment Executed',body:`Your payment of ${payment.currency} ${payment.amount.toLocaleString()} to ${payment.beneficiaryName} has been executed.`,data:{type:'PAYMENT_EXECUTED',paymentId,customerId,amount:String(payment.amount),currency:payment.currency,beneficiaryName:payment.beneficiaryName}});
+          if(payment?.coSignerId){
+            const coSignerToken=fcmTokens[payment.coSignerId];
+            if(coSignerToken) await sendPush(coSignerToken,{title:'✅ Payment Approved',body:`The payment to ${payment.beneficiaryName} has been fully approved and executed.`,data:{type:'PAYMENT_EXECUTED',paymentId}});
+          }
+        }
+      }
+      // Lombard credit approval
+      if(taskKey==='creditApproval'){
+        const creditId=varMap.creditId;
+        const credit=lombardCredits[creditId];
+        if(credit){
+          if(decision==='APPROVE'){
+            credit.status='APPROVED';
+            credit.approvedAmount=parseFloat(varMap.approvedAmount||credit.requestedAmount);
+            credit.approvedAt=now();
+            credit.approvedBy=req.user.userId;
+            recalcLombard(credit);
+            broadcast({eventType:'LOMBARD_UPDATED',payload:credit,occurredAt:now()});
+            const tok=fcmTokens[credit.customerId];
+            if(tok) await sendPush(tok,{title:'Lombard Credit Approved',body:'Your credit line of '+credit.currency+' '+credit.approvedAmount.toLocaleString()+' has been approved.',data:{type:'LOMBARD_APPROVED',creditId}});
+          } else {
+            credit.status='REJECTED';
+            credit.rejectedAt=now();
+            credit.rejectedBy=req.user.userId;
+            const tok=fcmTokens[credit.customerId];
+            if(tok) await sendPush(tok,{title:'Lombard Credit Declined',body:'Your Lombard credit request has been declined.',data:{type:'LOMBARD_REJECTED',creditId}});
+          }
+        }
+      }
+    }catch(e){console.error('Complete task background error:',e.message);}
+  });
+});
+
+
+
+
+// ── Avaloq Mock Client ────────────────────────────────────────────────────────
 // ── Lombard Credit ────────────────────────────────────────────────────────────
 
 const haircuts = {
@@ -811,14 +1316,16 @@ function calcEligibleCollateral(portfolioIds) {
       });
     }
     // Cash
-    const meta = portfolioMeta[pid];
-    if (meta) {
-      const cashEligible = meta.cash * 0.95;
+    {
+      // Cash from Avaloq positions
+      const cashPositions = getLivePositions(pid).filter(p => p.assetClass === 'Cash & Money Market');
+      const cashTotal = cashPositions.reduce((s,p) => s + p.marketValueChf, 0);
+      const cashEligible = cashTotal * 0.95;
       totalChf += cashEligible;
       result.push({
         portfolioId: pid, instrumentId: 'CASH', name: 'Cash & Money Market',
-        quantity: 1, price: meta.cash, currency: 'CHF',
-        marketValueChf: +meta.cash.toFixed(2),
+        quantity: 1, price: cashTotal, currency: 'CHF',
+        marketValueChf: +cashTotal.toFixed(2),
         haircut: 0.05, haircutPct: 5,
         eligibleChf: +cashEligible.toFixed(2),
       });
@@ -1254,15 +1761,30 @@ function getAggregatedDashboardForUser(userId) {
 
 // ── RM Client Overview ────────────────────────────────────────────────────────
 app.get('/rm/clients', authenticate, (req, res) => {
-  // Return all PRIVATE_CLIENT users with their live portfolio data
-  const clients = users
-    .filter(u => u.role === 'PRIVATE_CLIENT')
+  // Return clients accessible to this RM
+  // Future: filter by Entra group / assignedBpIds
+  const staffId = req.user.staffId || req.user.userId;
+  const staff   = STAFF_DIRECTORY[staffId];
+
+  // Get client users — if RM has assignedBpIds, filter to those clients
+  // For now return all PRIVATE_CLIENT users (single RM demo)
+  const clients = clientUsers
     .map(u => {
       const dashboard = getAggregatedDashboardForUser(u.id);
+      // Get portfolios from Avaloq cache
+      const personId   = u.avaloqPersonId;
+      const bpIds      = avaloqCache.personToBps[personId] || [];
+      const portfolios = bpIds.flatMap(bpId =>
+        (avaloqCache.bps[bpId]?._containerIds || [])
+      ).map(cid => avaloqCache.containers[cid]?.extn?.contNr?.[0]?.val).filter(Boolean);
+
+      // Get Lombard credit for this client
+      const lombard = Object.values(lombardCredits).find(c => c.customerId === u.id);
+
       return {
         id:           u.id,
         name:         u.name,
-        portfolios:   u.portfolios || [],
+        portfolios,
         totalAum:     dashboard?.totalAum ?? 0,
         dayChange:    dashboard?.totalDayChange ?? 0,
         dayChangePct: dashboard?.totalDayChangePct ?? 0,
