@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Designations xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <DateGenerated>16/06/2026</DateGenerated>
+  <Designation>
+    <LastUpdated>16/04/2026</LastUpdated>
+    <DateDesignated>29/06/2012</DateDesignated>
+    <UniqueID>AFG0001</UniqueID>
+    <OFSIGroupID>12703</OFSIGroupID>
+    <UNReferenceNumber>TAe.010</UNReferenceNumber>
+    <Names>
+      <Name>
+        <Name6>HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE</Name6>
+        <NameType>Primary Name</NameType>
+      </Name>
+      <Name>
+        <Name6>Haji Alim Hawala</Name6>
+        <NameType>Alias</NameType>
+      </Name>
+      <Name>
+        <Name6>Haji Hakim Hawala</Name6>
+        <NameType>Alias</NameType>
+      </Name>
+    </Names>
+    <RegimeName>The Afghanistan (Sanctions) (EU Exit) Regulations 2020</RegimeName>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Asset freeze</SanctionsImposed>
+    <OtherInformation>Afghan Money Service Provider License Number: 044.</OtherInformation>
+    <UKStatementofReasons>
+</UKStatementofReasons>
+    <Addresses>
+      <Address>
+        <AddressLine1>Ansari Market, 2nd Floor</AddressLine1>
+        <AddressLine6>Nimroz Province</AddressLine6>
+        <AddressCountry>Afghanistan</AddressCountry>
+      </Address>
+    </Addresses>
+  </Designation>
+  <Designation>
+    <LastUpdated>14/04/2026</LastUpdated>
+    <DateDesignated>25/01/2001</DateDesignated>
+    <UniqueID>AFG0006</UniqueID>
+    <OFSIGroupID>7172</OFSIGroupID>
+    <UNReferenceNumber>TAi.002</UNReferenceNumber>
+    <Names>
+      <Name>
+        <Name1>MOHAMMAD</Name1>
+        <Name2>HASSAN</Name2>
+        <Name6>AKHUND</Name6>
+        <NameType>Primary Name</NameType>
+      </Name>
+    </Names>
+    <Titles>
+      <Title>Mullah</Title>
+      <Title>Haji</Title>
+    </Titles>
+    <RegimeName>The Afghanistan (Sanctions) (EU Exit) Regulations 2020</RegimeName>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Asset freeze|Travel Ban</SanctionsImposed>
+    <OtherInformation>A close associate of Mullah Mohammed Omar.</OtherInformation>
+    <UKStatementofReasons>
+</UKStatementofReasons>
+    <Addresses>
+      <Address>
+        <AddressLine6>Kabul</AddressLine6>
+        <AddressCountry>Afghanistan</AddressCountry>
+      </Address>
+    </Addresses>
+    <IndividualDetails>
+      <Individual>
+        <DOBs>
+          <DOB>dd/mm/1945</DOB>
+          <DOB>dd/mm/1946</DOB>
+        </DOBs>
+        <PassportDetails>
+          <Passport>
+            <PassportNumber>P04581926</PassportNumber>
+            <PassportAdditionalInformation>Afghanistan passport number P04581926, issued on 7 August 2024</PassportAdditionalInformation>
+          </Passport>
+        </PassportDetails>
+        <Nationalities>
+          <Nationality>Afghanistan</Nationality>
+        </Nationalities>
+        <Positions>
+          <Position>First Deputy, Council of Ministers under the previous Taliban regime (1996-2001)</Position>
+        </Positions>
+        <BirthDetails>
+          <Location>
+            <TownOfBirth>Pashmul village, Panjwai District, Kandahar Province</TownOfBirth>
+            <CountryOfBirth>Afghanistan</CountryOfBirth>
+          </Location>
+        </BirthDetails>
+      </Individual>
+    </IndividualDetails>
+  </Designation>
+  <Designation>
+    <LastUpdated>29/04/2026</LastUpdated>
+    <DateDesignated>25/01/2001</DateDesignated>
+    <UniqueID>AFG0007</UniqueID>
+    <OFSIGroupID>6909</OFSIGroupID>
+    <UNReferenceNumber>TAi.003</UNReferenceNumber>
+    <Names>
+      <Name>
+        <Name1>Abdul Kabir</Name1>
+        <Name6>MOHAMMAD JAN</Name6>
+        <NameType>Primary Name</NameType>
+      </Name>
+      <Name>
+        <Name6>A Kabir</Name6>
+        <NameType>Alias</NameType>
+        <AliasStrength>Good quality a.k.a</AliasStrength>
+      </Name>
+    </Names>
+    <RegimeName>The Afghanistan (Sanctions) (EU Exit) Regulations 2020</RegimeName>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Asset freeze|Travel Ban</SanctionsImposed>
+    <OtherInformation>Active in terrorist operations in Eastern Afghanistan.</OtherInformation>
+    <UKStatementofReasons>
+</UKStatementofReasons>
+    <IndividualDetails>
+      <Individual>
+        <DOBs>
+          <DOB>30/01/1972</DOB>
+          <DOB>dd/mm/1963</DOB>
+        </DOBs>
+        <PassportDetails>
+          <Passport>
+            <PassportNumber>D0009925</PassportNumber>
+            <PassportAdditionalInformation>Afghanistan diplomatic passport number D0009925</PassportAdditionalInformation>
+          </Passport>
+        </PassportDetails>
+        <Nationalities>
+          <Nationality>Afghanistan</Nationality>
+        </Nationalities>
+        <BirthDetails>
+          <Location>
+            <TownOfBirth>Nahrin District, Baghlan Province</TownOfBirth>
+            <CountryOfBirth>Afghanistan</CountryOfBirth>
+          </Location>
+        </BirthDetails>
+      </Individual>
+    </IndividualDetails>
+  </Designation>
+</Designations>

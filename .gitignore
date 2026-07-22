@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment config — contains real URLs, tokens, and API keys.
+# NEVER commit this. Only .env.example (the template) should be tracked.
+.env
+.env.local
+.env.*.local
+
+# Local SQLite database — contains real sanctions/PEP/screening data.
+# This should never end up in a git repo, let alone a shared one.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Downloaded bulk data files (e.g. OpenSanctions entities.ftm.json) —
+# large, regenerable, and potentially license-restricted to redistribute.
+*.ftm.json
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Test artifacts
+coverage/

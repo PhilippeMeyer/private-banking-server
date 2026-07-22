@@ -1,0 +1,39 @@
+{
+  "name": "kyc-screening-service",
+  "version": "0.1.0",
+  "description": "KYC risk screening microservice: sanctions/PEP/adverse-media list matching, fuzzy name matching, risk scoring, and audit trail.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "migrate": "ts-node src/db/migrate.ts",
+    "import:now": "ts-node src/ingestion/scheduler.ts --run-once",
+    "diagnose:network": "ts-node src/diagnose-network.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "uuid": "^9.0.1",
+    "xlsx": "^0.18.5",
+    "xml2js": "^0.6.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.15",
+    "@types/node-cron": "^3.0.11",
+    "@types/uuid": "^9.0.8",
+    "@types/xml2js": "^0.4.14",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

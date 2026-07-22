@@ -1,0 +1,4 @@
+{"id":"NK-pep1","schema":"Person","caption":"Jane PEP Minister","datasets":["us_state_dept"],"properties":{"name":["Jane PEP Minister"],"alias":["J. Minister"],"birthDate":["1970-05-01"],"nationality":["us"],"topics":["role.pep"]}}
+{"id":"NK-sanctioned1","schema":"Person","caption":"Bad Actor Sanctioned","datasets":["us_ofac_sdn"],"properties":{"name":["Bad Actor Sanctioned"],"nationality":["ru"],"topics":["sanction"]}}
+{"id":"NK-rca1","schema":"Person","caption":"Family Of Minister","datasets":["everypolitician"],"properties":{"name":["Family Of Minister"],"nationality":["us"],"topics":["role.rca"]}}
+{"id":"NK-org1","schema":"Organization","caption":"Some PEP-Linked Foundation","datasets":["everypolitician"],"properties":{"name":["Some PEP-Linked Foundation"],"topics":["role.pep"]}}
