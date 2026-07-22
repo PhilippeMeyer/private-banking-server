@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xmlns:flowable="http://flowable.org/bpmn"
+             targetNamespace="http://private-banking.com/bpmn">
+
+  <process id="paymentApproval" name="Payment Approval" isExecutable="true">
+
+    <startEvent id="start" name="Payment Initiated"/>
+
+    <scriptTask id="initPayment" name="Initialize Payment" scriptFormat="javascript">
+      <script>
+        var amount = parseFloat(execution.getVariable('amount'));
+        var fees = amount * 0.001;
+        if (fees &lt; 5) fees = 5;
+        if (fees &gt; 500) fees = 500;
+        execution.setVariable('fees', Math.round(fees * 100) / 100);
+        execution.setVariable('totalAmount', Math.round((amount + fees) * 100) / 100);
+        execution.setVariable('paymentStatus', 'PENDING');
+        execution.setVariable('initiatedAt', new java.util.Date().toString());
+      </script>
+    </scriptTask>
+
+    <exclusiveGateway id="needsApproval" name="Needs Approval?"/>
+
+    <scriptTask id="autoApprove" name="Auto Approve" scriptFormat="javascript">
+      <script>
+        execution.setVariable('paymentStatus', 'EXECUTED');
+        execution.setVariable('executedAt', new java.util.Date().toString());
+        execution.setVariable('approvalPath', 'STRAIGHT_THROUGH');
+      </script>
+    </scriptTask>
+
+    <userTask id="coSignerApproval" name="Co-Signer Approval"
+              flowable:assignee="${coSignerId}">
+      <extensionElements>
+        <flowable:formProperty id="paymentId"        name="Payment ID"    type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="amount"           name="Amount"        type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="currency"         name="Currency"      type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="beneficiaryName"  name="Beneficiary"   type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="iban"             name="IBAN"          type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="reference"        name="Reference"     type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="customerId"       name="Customer ID"   type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="customerName"     name="Customer Name" type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="coSignerDecision" name="Decision"      type="enum"   readable="true" writable="true" required="true">
+          <flowable:value id="APPROVE" name="Approve"/>
+          <flowable:value id="REJECT"  name="Reject"/>
+        </flowable:formProperty>
+        <flowable:formProperty id="coSignerComment"  name="Comment"       type="string" readable="true" writable="true"/>
+      </extensionElements>
+    </userTask>
+
+    <exclusiveGateway id="coSignerDecisionGw" name="Co-Signer Decision?"/>
+
+    <scriptTask id="setCoSignerRejected" name="Set Rejected by Co-Signer" scriptFormat="javascript">
+      <script>
+        execution.setVariable('paymentStatus', 'REJECTED');
+        execution.setVariable('rejectedBy', 'CO_SIGNER');
+      </script>
+    </scriptTask>
+
+    <exclusiveGateway id="needsRM" name="Needs RM?"/>
+
+    <userTask id="rmApproval" name="RM Approval"
+              flowable:candidateGroups="relationship_managers">
+      <extensionElements>
+        <flowable:formProperty id="paymentId"        name="Payment ID"    type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="amount"           name="Amount"        type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="currency"         name="Currency"      type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="beneficiaryName"  name="Beneficiary"   type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="iban"             name="IBAN"          type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="reference"        name="Reference"     type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="customerId"       name="Customer ID"   type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="customerName"     name="Customer Name" type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="coSignerDecision" name="Co-Signer"     type="string" readable="true" writable="false"/>
+        <flowable:formProperty id="rmDecision"       name="Decision"      type="enum"   readable="true" writable="true" required="true">
+          <flowable:value id="APPROVE" name="Approve"/>
+          <flowable:value id="REJECT"  name="Reject"/>
+        </flowable:formProperty>
+        <flowable:formProperty id="rmComment"        name="RM Comment"    type="string" readable="true" writable="true"/>
+      </extensionElements>
+    </userTask>
+
+    <exclusiveGateway id="rmDecisionGw" name="RM Decision?"/>
+
+    <scriptTask id="setRMRejected" name="Set Rejected by RM" scriptFormat="javascript">
+      <script>
+        execution.setVariable('paymentStatus', 'REJECTED');
+        execution.setVariable('rejectedBy', 'RELATIONSHIP_MANAGER');
+      </script>
+    </scriptTask>
+
+    <scriptTask id="executePayment" name="Execute Payment" scriptFormat="javascript">
+      <script>
+        execution.setVariable('paymentStatus', 'EXECUTED');
+        execution.setVariable('executedAt', new java.util.Date().toString());
+      </script>
+    </scriptTask>
+
+    <endEvent id="endAutoApproved"   name="Auto Approved"/>
+    <endEvent id="endCoSignRejected" name="Co-Sign Rejected"/>
+    <endEvent id="endRMRejected"     name="RM Rejected"/>
+    <endEvent id="endExecuted"       name="Executed"/>
+
+    <sequenceFlow id="f1"  sourceRef="start"              targetRef="initPayment"/>
+    <sequenceFlow id="f2"  sourceRef="initPayment"         targetRef="needsApproval"/>
+    <sequenceFlow id="f3"  sourceRef="needsApproval"       targetRef="autoApprove">
+      <conditionExpression xsi:type="tFormalExpression">${amount &lt;= 10000}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f4"  sourceRef="needsApproval"       targetRef="coSignerApproval">
+      <conditionExpression xsi:type="tFormalExpression">${amount &gt; 10000}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f5"  sourceRef="autoApprove"         targetRef="endAutoApproved"/>
+    <sequenceFlow id="f6"  sourceRef="coSignerApproval"    targetRef="coSignerDecisionGw"/>
+    <sequenceFlow id="f7"  sourceRef="coSignerDecisionGw"  targetRef="setCoSignerRejected">
+      <conditionExpression xsi:type="tFormalExpression">${coSignerDecision == 'REJECT'}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f8"  sourceRef="coSignerDecisionGw"  targetRef="needsRM">
+      <conditionExpression xsi:type="tFormalExpression">${coSignerDecision == 'APPROVE'}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f9"  sourceRef="setCoSignerRejected" targetRef="endCoSignRejected"/>
+    <sequenceFlow id="f10" sourceRef="needsRM"             targetRef="executePayment">
+      <conditionExpression xsi:type="tFormalExpression">${amount &lt;= 50000}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f11" sourceRef="needsRM"             targetRef="rmApproval">
+      <conditionExpression xsi:type="tFormalExpression">${amount &gt; 50000}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f12" sourceRef="rmApproval"          targetRef="rmDecisionGw"/>
+    <sequenceFlow id="f13" sourceRef="rmDecisionGw"        targetRef="setRMRejected">
+      <conditionExpression xsi:type="tFormalExpression">${rmDecision == 'REJECT'}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f14" sourceRef="rmDecisionGw"        targetRef="executePayment">
+      <conditionExpression xsi:type="tFormalExpression">${rmDecision == 'APPROVE'}</conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="f15" sourceRef="setRMRejected"       targetRef="endRMRejected"/>
+    <sequenceFlow id="f16" sourceRef="executePayment"       targetRef="endExecuted"/>
+
+  </process>
+</definitions>

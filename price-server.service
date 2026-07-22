@@ -1,0 +1,15 @@
+[Unit]
+Description=PrivateBank Price Server
+After=network.target
+
+[Service]
+Type=simple
+User=philippe
+WorkingDirectory=/srv/private-banking/price-server
+ExecStart=/usr/bin/node price_server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
